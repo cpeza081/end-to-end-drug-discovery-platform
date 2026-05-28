@@ -25,15 +25,15 @@ from typing import Any # for type hinting (e.g. dict[str, Any] means a dictionar
 # Optional dependency: Pipeline works with all defaults if it is absent. Flag is checked precisely where it matters, not at import time, so error messages are contextual and only raised if you actually try to load or save a config file. 
 # This way, users who don't need YAML support (e.g. those who hard-code a PipelineConfig in Python) aren't forced to install an extra package. 
 try:
-    import yaml  # type: ignore[import]
+    import yaml
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-step configuration blocks
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────#
+#                         Per-step configuration blocks                        #
+# ─────────────────────────────────────────────────────────────────────────────#
 
 @dataclass
 class FilterConfig:
@@ -48,11 +48,13 @@ class FilterConfig:
     """
     enabled: bool = True
 
-    # LogP window (Wildman–Crippen sLogP)
+    # LogP window (Wildman–Crippen sLogP), targets drug-like lipophilicity.
+    # These match the df.loc[(df['sLogP'] <= 3.5) & (df['sLogP'] >= 1)] line in extract_smiles.py, but feel free to adjust as needed for your library. 
     slogp_min: float = 1.0
     slogp_max: float = 3.5
 
     # Rotatable bond ceiling
+
     rot_bonds_max: int = 6
 
     # Exact molecular weight window (Da)
@@ -60,6 +62,7 @@ class FilterConfig:
     mw_max: float = 450.0
 
     # Fraction of sp³ carbons — promotes 3-D character
+    # Fraction of sp^3 carbons >= 0.25 is a 3-dimensionality heuristic to avoid flat, aromatic molecules that have poor clinical success rates. This came from the original script.
     fsp3_min: float = 0.25
 
     # Aromatic ring count (range filter)
@@ -73,7 +76,7 @@ class FilterConfig:
     total_rings_min: int = 3
     total_rings_max: int = 4
 
-    # Only keep neutral molecules
+    # Only keep neutral molecules. Charged species would require counter-ions that complicate docking.
     formal_charge: int = 0
 
 
@@ -106,10 +109,13 @@ class FlipperConfig:
     # Add a numeric suffix to each isomer name to guarantee uniqueness
     warts: bool = True
 
-    # Enumerate pyramidal nitrogens (set True for amine-rich libraries)
+    # Enumerate pyramidal nitrogens (set True for amine-rich libraries). 
+    # Defaults to False to match OpenEye's default and avoid library explosion for typical use.
     enum_nitrogen: bool = False
 
-    # Any extra CLI flags passed verbatim to flipper
+    # Any extra CLI flags passed verbatim to flipper. 
+    # Any OpenEye flag not explicityly modelled in this config can be passed as a raw string.
+    # So, behaviour can be tweaked without code changes as new OpenEye versions add features or change defaults.
     extra_args: str = ""
 
 
@@ -141,8 +147,8 @@ class OmegaConfig:
     """
     OpenEye OMEGA — generate low-energy 3-D conformers (optional).
 
-    This step is NOT required for the initial library preparation fed to the
-    DD fingerprint/ML pipeline.  It IS required to produce dockable structures
+    This step is not required for the initial library preparation fed to the
+    DD fingerprint/ML pipeline.  It is, however, required to produce dockable structures
     for the molecules sampled at each DD iteration (Stage IV of the protocol).
     Enable here only if you want the full library pre-processed in 3-D.
 
@@ -174,20 +180,20 @@ class FingerprintConfig:
     Format per molecule:
         <mol_name>,<bit_idx_1>,<bit_idx_2>,...
 
-    This is exactly the format expected by DD's sampling.py and
+    This is the format expected by DD's sampling.py and
     extracting_morgan.py scripts.
 
     Reference: Gentile et al. Nature Protocols 2022, Box 1.
     """
     enabled: bool = True
-    radius: int = 2       # Morgan radius — DD uses radius 2
+    radius: int = 2       # Morgan radius — DD uses radius 2, mandated by the protocol, as cited in docstring.
     n_bits: int = 1024    # Fingerprint length — DD uses 1024 bits
     n_workers: int = 8    # Parallel worker processes
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Top-level pipeline configuration
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────── #
+#                      Top-level pipeline configuration                         #
+# ───────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class PipelineConfig:
@@ -202,7 +208,7 @@ class PipelineConfig:
     omitted in the YAML if defaults are acceptable.
     """
 
-    # ── I/O ──────────────────────────────────────────────────────────────────
+    # ── I/O ──────────────────────────────────────────────────────────────
     # Path to the raw SMILES library.  Expected format: two-column
     # space-separated file with headers 'smiles' and 'idnumber'.
     input_file: str = ""
@@ -212,14 +218,17 @@ class PipelineConfig:
 
     # ── Execution ────────────────────────────────────────────────────────────
     # Maximum number of chunk files processed simultaneously for
-    # OpenEye steps (flipper, tautomers, omega).
+    # OpenEye steps (flipper, tautomers, omega). 
+    # It is a resource constraint that applies across all external tool steps.
     n_parallel: int = 4
 
     # Resume a previously interrupted run: skip steps whose output
-    # already exists on disk.
+    # already exists on disk. 
+    # If the pipeline crashes halfway through, this lets you fix the issue and pick up where you left off without re-running everything.
     resume: bool = True
 
     # Show what would be executed without actually running it.
+    # Helps to clarify the effects of a config on a new cluster before submitting a long job.
     dry_run: bool = False
 
     # ── Stage configs ─────────────────────────────────────────────────────────
@@ -231,12 +240,14 @@ class PipelineConfig:
     fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loader helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────#
+#                      Loader helpers
+# ─────────────────────────────────────────────────────────────────────────────#
 
 def _deep_update(base: dict, overrides: dict) -> dict:
-    """Recursively merge *overrides* into *base* (in place), return base."""
+    """Recursive dictionary merge: *overrides* into *base* (in place), return base.
+    When both base and overrides have a dict at a given key, merge them rather than replacing the whole dict.
+    This allows partial overrides of nested sections without needing to specify every parameter."""
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
             _deep_update(base[key], value)
@@ -285,31 +296,43 @@ def load_config(yaml_path: str | None = None, overrides: dict | None = None) -> 
     -------
     PipelineConfig
     """
-    if yaml_path is not None and not _YAML_AVAILABLE:
+    if yaml_path is not None and not _YAML_AVAILABLE: # Only raise an error if the user actually tries to load a YAML config, not at import time, so users who hard-code a PipelineConfig in Python aren't forced to install PyYAML.
         raise ImportError(
             "PyYAML is required to load a config file: pip install pyyaml"
         )
 
-    raw: dict[str, Any] = asdict(PipelineConfig())  # start with all defaults
+    raw: dict[str, Any] = asdict(PipelineConfig())  # start with all defaults, layer changes on top.
 
-    if yaml_path is not None:
-        with open(yaml_path) as fh:
+    if yaml_path is not None: 
+        with open(yaml_path) as fh: # Load the YAML file into a dict. If the file is empty, yaml.safe_load returns None, so we use "or {}" to ensure we get an empty dict instead.
             user_yaml = yaml.safe_load(fh) or {}
-        _deep_update(raw, user_yaml)
+        _deep_update(raw, user_yaml) # Merge the user YAML on top of the defaults, so that any keys specified in the YAML override the defaults, while unspecified keys remain unchanged.
 
-    if overrides:
-        for dotted_key, value in overrides.items():
-            parts = dotted_key.split(".")
+    # Dot-notation override resolution. 
+    # The loop walks down the nested dict for all parts except the last, creating intermediate dicts as needed, 
+    # then sets the final part to the override value. 
+    # This allows users to override deeply nested parameters without needing to specify the entire section in YAML.
+    if overrides: 
+        for dotted_key, value in overrides.items(): #loop through each override pair.
+            parts = dotted_key.split(".") #split keys at each dot. a
             target = raw
-            for part in parts[:-1]:
-                target = target.setdefault(part, {})
-            target[parts[-1]] = value
+            for part in parts[:-1]: #Loop through all parts except the last.
+
+                # setdefault() checks if part already exists as a key in the current level of the dict. 
+                # if it does, it returns the existing value (which should be a dict). 
+                # if it doesn't, it creates a new empty dict at that key and returns it. 
+                # This way, we ensure that the intermediate levels of the nested dict exist as we walk down to the final key.
+                # Typos or logical errors in the dotted keys will create new nested dicts rather than overwriting existing config sections, which provides some safety against accidental overrides.
+                target = target.setdefault(part, {}) 
+            target[parts[-1]] = value # Finally, set the last part to the override value.
 
     return _dict_to_config(raw)
 
 
 def save_config(cfg: PipelineConfig, path: str) -> None:
-    """Serialise a PipelineConfig to YAML for reproducibility / audit trail."""
+    """Serialises the entire config back to YAML. Uses asdict, which flattens the dataclass tree 
+    into a plain dict that YAML can handle. This produces the audit trail file that should be saved 
+    alongside every pipeline run for reproducibility."""
     if not _YAML_AVAILABLE:
         raise ImportError("PyYAML is required: pip install pyyaml")
     with open(path, "w") as fh:
