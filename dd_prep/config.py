@@ -322,7 +322,8 @@ def load_config(yaml_path: str | None = None, overrides: dict | None = None) -> 
                 # if it does, it returns the existing value (which should be a dict). 
                 # if it doesn't, it creates a new empty dict at that key and returns it. 
                 # This way, we ensure that the intermediate levels of the nested dict exist as we walk down to the final key.
-                # Typos or logical errors in the dotted keys will create new nested dicts rather than overwriting existing config sections, which provides some safety against accidental overrides.
+                # Typos or logical errors in the dotted keys will create new nested dicts rather than overwriting existing config sections, 
+                # which provides some safety against accidental overrides.
                 target = target.setdefault(part, {}) 
             target[parts[-1]] = value # Finally, set the last part to the override value.
 
@@ -335,5 +336,5 @@ def save_config(cfg: PipelineConfig, path: str) -> None:
     alongside every pipeline run for reproducibility."""
     if not _YAML_AVAILABLE:
         raise ImportError("PyYAML is required: pip install pyyaml")
-    with open(path, "w") as fh:
-        yaml.dump(asdict(cfg), fh, default_flow_style=False, sort_keys=False)
+    with open(path, "w") as fh: # Open the specified path for writing. If the file doesn't exist, it will be created. If it does exist, it will be overwritten.
+        yaml.dump(asdict(cfg), fh, default_flow_style=False, sort_keys=False)  # Dump the config as YAML. asdict(cfg) converts the PipelineConfig dataclass (and all nested dataclasses) into a plain dict.
