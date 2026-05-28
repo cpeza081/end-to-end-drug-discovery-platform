@@ -1,0 +1,9 @@
+#   pip install -r requirements.txt
+#
+# For a proper editable install (recommended during development):
+#   pip install -e ".[dev]"
+
+pyyaml>=6.0
+pandas>=2.0
+rdkit>=2023.3
+tqdm>=4.0

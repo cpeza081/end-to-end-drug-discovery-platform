@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+ 
+[project]
+name = "dd_prep"
+version = "0.1.0"
+description = "Deep Docking library preparation pipeline"
+requires-python = ">=3.9"
+ 
+# Core dependencies — always required
+dependencies = [
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "rdkit>=2023.3",
+    "tqdm>=4.0",       # progress bars
+]
+ 
+[project.optional-dependencies]
+# Install with: pip install -e ".[dev]"
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",            # linter / formatter
+    "mypy>=1.0",
+]
+ 
+[project.scripts]
+# Enables: dd-prep --config my_config.yaml  (once cli.py is written)
+dd-prep = "dd_prep.cli:main"
+ 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dd_prep*"]
+ 
+# ── Linter / type-checker settings ───────────────────────────────────────────
+ 
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+ 
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]   # pycodestyle + pyflakes + isort
+ 
+[tool.mypy]
+python_version = "3.9"
+warn_unused_ignores = true
+ignore_missing_imports = true   # RDKit stubs are incomplete; suppresses false positives
