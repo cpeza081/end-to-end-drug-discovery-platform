@@ -16,4 +16,4 @@ Pipeline stages (each independently toggleable):
 """
  
 __version__ = "0.1.0"
-__author__ = "dd_prep contributors"
+__author__ = "Cole Pezacki"

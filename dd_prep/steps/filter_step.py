@@ -17,7 +17,7 @@ The filter is optional (enabled: false in YAML) for libraries that are
 already curated (e.g. ZINC drug-like subset).
 ─────────────────────────────
 
-How a new step is added.
+How a new step is added:
 ─────────────────────────────
 1. Create a new class subclassing PipelineStep, set name, implement run() and optionally validate().
 2. Add a dataclass with enabled set to True to config.py and a default instance field to PipelineConfig.
