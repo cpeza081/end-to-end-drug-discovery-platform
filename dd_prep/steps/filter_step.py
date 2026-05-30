@@ -21,7 +21,7 @@ How a new step is added:
 ─────────────────────────────
 1. Create a new class subclassing PipelineStep, set name, implement run() and optionally validate().
 2. Add a dataclass with enabled set to True to config.py and a default instance field to PipelineConfig.
-3. Register it in pipeline.py's step list. NOTE: pipeline.py is not created yet as of May 28, 2026, 1:28 PM.
+3. Register it in pipeline.py's step list. 
 ─────────────────────────────
 
 
