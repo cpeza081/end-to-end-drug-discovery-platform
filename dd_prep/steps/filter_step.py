@@ -39,6 +39,8 @@ from pathlib import Path
 from dd_prep.steps.base import PipelineStep, PipelineContext
 from dd_prep.config import FilterConfig
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,7 +71,6 @@ class FilterStep(PipelineStep):
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def run(self, ctx: PipelineContext) -> PipelineContext:
-        import pandas as pd
         from rdkit.Chem import PandasTools, Descriptors, rdMolDescriptors, rdmolops # imported here to ensure the validate() check ran first; if RDKit isn't available, the step will fail during validation rather than after hours of processing.
 
         cfg: FilterConfig = self.config # type hint for convenience; self.config is actually just a dict, but we know from the pipeline setup that it has the structure of FilterConfig, so this lets us access config parameters with dot notation and get autocompletion in IDEs.

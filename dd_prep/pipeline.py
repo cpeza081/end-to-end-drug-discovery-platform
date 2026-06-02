@@ -208,6 +208,7 @@ class Pipeline:
         Without this, a step skipped on resume leaves holes in the context
         that break all later steps.
         """
+        # This is a bit of a hack — ideally each step would have a more robust way to determine its outputs on resume rather than relying on directory structure and naming conventions. But this works for now and keeps the checkpoint system simple.
         smiles_dir   = self.work_dir / "smiles"
         lib_dir      = self.work_dir / "library_prepared"
         fp_dir       = self.work_dir / "library_prepared_fp"
