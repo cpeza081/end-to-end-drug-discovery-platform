@@ -20,8 +20,6 @@ Adding a new step
 3. Add one line to ``_build_steps()`` below — that is the only place
    in the entire codebase that must change. 
 ─────────────────
-NOTE: pipeline.py includes imports from all steps, including ones that are not built yet as of this writing. 
-This program will therefore produce an error in its current form as of May 29, 2026, 6:42PM EST.
 """
 
 from __future__ import annotations
