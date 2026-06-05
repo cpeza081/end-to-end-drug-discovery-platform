@@ -164,6 +164,61 @@ class Pipeline:
         logger.info("=" * 62)
 
         return ctx
+    
+    def run_single_step(
+            self, 
+            step_name: str,
+            chunk_index: int | None = None,
+        ) -> PipelineContext:
+        """
+        Run one named step, optionally on a single chunk file. 
+
+        This is the entry point for SLURM array jobs. It reconstructs the pipeline context entirely from what is already on disk,
+        so that no in-memory state is carried from previous jobs. 
+
+        Parameters
+        ----------
+        step_name : str
+            Name of the step to run (eg "flipper", or "tautomer").
+        chunk_index : int | None
+            0-based index into the sorted chunk file list.  If provided,
+            only that one file is processed.  If the index exceeds the 
+            number of available files, the function returns immediately
+            (clean no-op, letting you submit a fixed-sized array job).
+        """
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        setup_logging(self.work_dir)
+
+        # Find the requested step.
+        step = self._get_step(step_name)
+        if step is None:
+            raise ValueError(
+                f"Unknown step '{step_name}'. "
+                f"Available: {[s.name for s in self.steps]}"
+            )
+        
+        if not step.enabled:
+            logger.info("Step '%s' is disabled in the config.", step.name)
+            return self._build_context()
+        
+        # Reconstruct context from disk so this job is self contained.
+        ctx = self._build_context()
+        for s in self.steps:
+            ctx = self._repopulate_context(s, ctx)
+
+        # Inject chunk_index so the step processes only one file.
+        if chunk_index is not None:
+            ctx.set("chunk_index", chunk_index)
+
+        logger.info(
+            "[%s] Single-step mode  chunk_index=%s",
+            step.name,
+            chunk_index if chunk_index is not None else "all",
+        )
+        t0 = time.time()
+        ctx = step.run(ctx)
+        logger.info("[%s] Done in %.1f s.", step.name, time.time() - t0)
+        return ctx
 
     # ── Step registry ─────────────────────────────────────────────────────────
 

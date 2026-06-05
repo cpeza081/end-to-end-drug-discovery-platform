@@ -23,6 +23,14 @@ from pathlib import Path # checking file existence and constructing output paths
 from dd_prep.config import load_config # loads the YAML config and applies CLI overrides
 from dd_prep.pipeline import Pipeline # Main workflow runner
 
+# Steps that operate on individual chunk files and therefore support --chunk-index.
+_ARRAY_STEPS = {"flipper", "tautomer", "fingerprint", "omega"}
+ 
+# Steps that must run once over all files and do not support --chunk-index.
+_SEQUENTIAL_STEPS = {"filter", "split", "organize"}
+ 
+_ALL_STEPS = _ARRAY_STEPS | _SEQUENTIAL_STEPS
+
 
 def build_parser() -> argparse.ArgumentParser:
     """
@@ -72,6 +80,32 @@ examples:
         help="Root directory for all intermediate and final outputs.",
     )
 
+    # ── Cluster / array-job flags ─────────────────────────────────────────────
+    
+    # '--step' allows the user to specify a single pipeline step to run, which is useful for running individual steps.
+    parser.add_argument(
+        "--step",
+        metavar="STEP",
+        choices=sorted(_ALL_STEPS),
+        help=(
+            "Run only this pipeline step. "
+            f"Array-capable steps: {sorted(_ARRAY_STEPS)}. "
+            f"Sequential steps: {sorted(_SEQUENTIAL_STEPS)}."
+        ),
+    )
+
+    # '--chunk-index' allows the user to specify which chunk of the input library to process, which is useful for parallelizing across a cluster.
+    parser.add_argument(
+        "--chunk-index",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "0-based chunk file index. Used with --step for SLURM array jobs. "
+            "If N >= number of chunks, the task exits cleanly (no error)."
+        ),
+    )
+
     # ── Execution flags ───────────────────────────────────────────────────────
     parser.add_argument(
         "--dry-run",
@@ -115,6 +149,15 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # ── Validate argument combinations ────────────────────────────────────────
+    if args.chunk_index is not None and args.step is None:
+        parser.error("--chunk-index requires --step.")
+    if args.chunk_index is not None and args.step in _SEQUENTIAL_STEPS:
+        parser.error(
+            f"--chunk-index is not supported for sequential step '{args.step}'. "
+            f"Array-capable steps are: {sorted(_ARRAY_STEPS)}."
+        )
+
     # ── Translate CLI args into config overrides ──────────────────────────────
     overrides: dict[str, object] = {}
     if args.input:
@@ -149,8 +192,15 @@ def main(argv: list[str] | None = None) -> None:
         ok = pipeline.validate()
         sys.exit(0 if ok else 1) # exit with 0 if validation passed, 1 if it failed, so this can be used in scripts and CI pipelines to block execution if the config isn't valid.
 
-    pipeline.run()
-
+    if args.step:
+        # Single-step mode: used by SLURM array jobs.
+        pipeline.run_single_step(
+            step_name=args.step,
+            chunk_index=args.chunk_index,
+        )
+    else:
+        # Full pipeline mode: normal local / login-node usage.
+        pipeline.run()
 
 if __name__ == "__main__":
     main() #allows cli.py to be run directly as a script, although it is normally invoked through the installed dd_prep entry point.
