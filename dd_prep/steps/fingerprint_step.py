@@ -72,6 +72,18 @@ class FingerprintStep(PipelineStep):
         dry_run: bool = ctx.get("dry_run", False)
         out_dir = self._mkdir(ctx.work_dir / "library_prepared_fp")
 
+        # In SLURM array mode, restrict to the one file for this task.
+        chunk_index: int | None = ctx.get("chunk_index")
+        if chunk_index is not None:
+            if chunk_index >= len(prepared_files):
+                self.logger.info(
+                    "chunk_index=%d >= total files (%d) — nothing to do.",
+                    chunk_index, len(prepared_files),
+                )
+                ctx.set("fp_files", [])
+                return ctx
+            prepared_files = [prepared_files[chunk_index]]
+
         # Build job list: (in_path, out_path, radius, n_bits)
         jobs: list[tuple[Path, Path, int, int]] = []
         fp_files: list[Path] = []

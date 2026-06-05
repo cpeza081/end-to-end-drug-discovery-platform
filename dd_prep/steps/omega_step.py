@@ -72,6 +72,18 @@ class OmegaStep(PipelineStep):
         out_ext = cfg.output_format.split(".")[0]   # "sdf" or "oeb"
         out_dir = self._mkdir(ctx.work_dir / out_ext)
 
+        # In SLURM array mode, restrict to the one file for this task.
+        chunk_index: int | None = ctx.get("chunk_index")
+        if chunk_index is not None:
+            if chunk_index >= len(prepared_files):
+                self.logger.info(
+                    "chunk_index=%d >= total files (%d) — nothing to do.",
+                    chunk_index, len(prepared_files),
+                )
+                ctx.set("sdf_files", [])
+                return ctx
+            prepared_files = [prepared_files[chunk_index]]
+
         commands: list[list[str]] = []
         sdf_files: list[Path] = []
 
