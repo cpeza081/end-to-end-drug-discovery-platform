@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4        # Pandas filter uses multiple cores
 #SBATCH --mem=32G                # Adjust down for smaller libraries
 #SBATCH --output=logs/01_filter_split_%j.log
-#SBATCH --account=def-YOURPI    # ← CHANGE THIS to your PI's account
+#SBATCH --account=rrg-checco89    # ← CHANGE THIS to your PI's account
 
 # =============================================================================
 # Job 1: Filter and split the raw SMILES library.

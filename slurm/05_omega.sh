@@ -7,7 +7,7 @@
 #SBATCH --mem=16G
 #SBATCH --array=0-999%10         # Throttle to 10 simultaneous — omega is memory-hungry
 #SBATCH --output=logs/05_omega_%A_%a.log
-#SBATCH --account=def-YOURPI    # ← CHANGE THIS
+#SBATCH --account=rrg-checco89    # ← CHANGE THIS
 
 # =============================================================================
 # Job 5 (optional): 3-D conformer generation with OpenEye OMEGA (array job).

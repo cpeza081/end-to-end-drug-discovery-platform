@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16       # Fingerprint step uses multiprocessing — give it cores
 #SBATCH --mem=32G
 #SBATCH --output=logs/04_organize_fp_%j.log
-#SBATCH --account=def-YOURPI    # ← CHANGE THIS
+#SBATCH --account=rrg-checco89    # ← CHANGE THIS
 
 # =============================================================================
 # Job 4: Organize into library_prepared/ and compute Morgan fingerprints.

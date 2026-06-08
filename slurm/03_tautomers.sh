@@ -7,7 +7,7 @@
 #SBATCH --mem=8G
 #SBATCH --array=0-999%20
 #SBATCH --output=logs/03_tautomers_%A_%a.log
-#SBATCH --account=def-YOURPI    # ← CHANGE THIS
+#SBATCH --account=rrg-checco89    # ← CHANGE THIS
 
 # =============================================================================
 # Job 3: Protonation state assignment with OpenEye TAUTOMERS (array job).

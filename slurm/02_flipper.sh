@@ -9,7 +9,7 @@
                                  # The %20 throttle protects the scheduler.
                                  # Tasks with index >= actual chunk count exit cleanly.
 #SBATCH --output=logs/02_flipper_%A_%a.log   # %A = job ID, %a = array index
-#SBATCH --account=def-YOURPI    # ← CHANGE THIS
+#SBATCH --account=rrg-checco89    # ← CHANGE THIS
 
 # =============================================================================
 # Job 2: Stereoisomer enumeration with OpenEye FLIPPER (array job).
