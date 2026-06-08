@@ -250,8 +250,9 @@ class PipelineConfig:
     flipper: FlipperConfig = field(default_factory=FlipperConfig)
     tautomer: TautomerConfig = field(default_factory=TautomerConfig)
     omega: OmegaConfig = field(default_factory=OmegaConfig)
-    fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
+    fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
+    
 
 # ─────────────────────────────────────────────────────────────────────────────#
 #                      Loader helpers
