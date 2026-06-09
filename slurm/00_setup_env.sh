@@ -17,7 +17,7 @@ set -euo pipefail
 # ── 1. Customise these two variables ─────────────────────────────────────────
 
 # Path to your dd_prep project (the folder containing pyproject.toml).
-PROJECT_DIR="$HOME/projects/dd_prep"
+PROJECT_DIR="$HOME/end-to-end-drug-discovery-platform/dd_prep"
 
 # Where the virtual environment will live.  $SCRATCH is the fast parallel
 # filesystem on DRA — much better than $HOME for large installs.
