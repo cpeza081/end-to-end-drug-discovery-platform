@@ -28,6 +28,7 @@ VENV_DIR="${DD_PREP_VENV:?Set DD_PREP_VENV or pass via --export to sbatch}"
 module purge
 module load StdEnv/2023
 module load python/3.11
+module load gcc rdkit
 
 source "$VENV_DIR/bin/activate"
 

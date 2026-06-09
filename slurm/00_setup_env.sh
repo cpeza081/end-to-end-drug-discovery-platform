@@ -29,6 +29,7 @@ VENV_DIR="$SCRATCH/dd_prep_venv"
 module purge
 module load StdEnv/2023
 module load python/3.11
+module load gcc rdkit
 
 echo "Python: $(which python) — $(python --version)"
 
@@ -47,7 +48,7 @@ source "$VENV_DIR/bin/activate"
 pip install --upgrade pip setuptools wheel --quiet
 
 # RDKit wheels are available on PyPI since RDKit 2022.
-pip install pyyaml pandas rdkit tqdm --quiet
+pip install pyyaml pandas tqdm --quiet
 
 # Install dd_prep itself in editable mode so code changes take effect
 # without reinstalling.
