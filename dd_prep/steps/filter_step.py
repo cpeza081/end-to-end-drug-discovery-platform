@@ -33,6 +33,8 @@ Output (to ctx):    "filter_file"  — path to filtered SMILES library
 
 from __future__ import annotations
 
+from importlib.resources import path
+from os import path
 import logging
 from pathlib import Path
 
@@ -92,7 +94,7 @@ class FilterStep(PipelineStep):
 
 
         self.logger.info("Loading library from %s …", input_file)
-        df = pd.read_csv(input_file, sep=" ", header=0, names=["smiles", "idnumber"]) # space-separated, two-column format with explicit column names.
+        df = pd._load_smiles(input_file, self.logger) # space-separated, two-column format with explicit column names.
         n_raw = len(df) 
         ctx.set("n_molecules_raw", n_raw)
         self.logger.info("  %d molecules loaded.", n_raw)
@@ -174,3 +176,73 @@ class FilterStep(PipelineStep):
             label, n_after, n_before - n_after,
         ) # the %-12s formats the label to be left-aligned in a 12-character-wide field, which makes the log output nicely aligned and easier to read.
         return df, n_after
+    
+    @staticmethod
+    def _load_smiles(path: Path, log: logging.Logger) -> pd.DataFrame:
+        """
+        Load a SMILES library file into a DataFrame with columns
+        ['smiles', 'idnumber'], regardless of the input format.
+
+        Handles automatically:
+            - Separators: spaces, tabs, commas
+            - Column order: SMILES first or ID first
+            - Header names: SMILES/smiles/smi, ID/idnumber/name, or no header
+            - Trailing whitespace
+        """
+        from rdkit import Chem
+
+         # ── Detect separator ─────────────────────────────────────────────────
+        with open(path) as fh:
+            first_line = fh.readline().strip()
+
+        if "\t" in first_line:
+            sep = "\t"
+        elif "," in first_line:
+            sep = ","
+        else:
+            sep = r"\s+"   # one or more spaces/tabs
+
+        # ── Load with detected separator ─────────────────────────────────────
+        df = pd.read_csv(path, sep=sep, header=0, engine="python",
+                        skipinitialspace=True).fillna("")
+
+        # Standardise column names to lowercase and strip whitespace
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        if len(df.columns) < 2:
+            raise ValueError(
+                f"Expected at least 2 columns in {path}, "
+                f"found {len(df.columns)}. "
+                "Check that the file uses a consistent separator."
+            )
+
+        # ── Detect which column contains SMILES ──────────────────────────────
+        smiles_names = {"smiles", "smi", "smile", "canonical_smiles"}
+        id_names     = {"id", "idnumber", "name", "molecule_name",
+                        "chembl_id", "zinc_id", "molid"}
+
+        col0, col1 = df.columns[0], df.columns[1]
+
+        if col0 in smiles_names or col1 in id_names:
+            smiles_col, id_col = col0, col1
+            log.info("  Detected column order: SMILES='%s'  ID='%s'", col0, col1)
+
+        elif col1 in smiles_names or col0 in id_names:
+            smiles_col, id_col = col1, col0
+            log.info("  Detected column order (swapped): SMILES='%s'  ID='%s'",
+                    col1, col0)
+
+        else:
+            # Fall back to trying to parse the first data value with RDKit
+            first_val = str(df.iloc[0, 0]).strip()
+            if Chem.MolFromSmiles(first_val) is not None:
+                smiles_col, id_col = col0, col1
+                log.info("  Auto-detected: SMILES in first column ('%s')", col0)
+            else:
+               smiles_col, id_col = col1, col0
+               log.info("  Auto-detected: SMILES in second column ('%s')", col1)
+
+        # ── Return with standardised column names ─────────────────────────────
+        return df[[smiles_col, id_col]].rename(
+            columns={smiles_col: "smiles", id_col: "idnumber"}
+        )

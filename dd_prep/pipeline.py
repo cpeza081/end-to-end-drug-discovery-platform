@@ -165,6 +165,12 @@ class Pipeline:
 
         return ctx
     
+    def _get_step(self, name: str) -> PipelineStep | None:
+        for step in self.steps:
+            if step.name == name:
+                return step
+        return None
+    
     def run_single_step(
             self, 
             step_name: str,
