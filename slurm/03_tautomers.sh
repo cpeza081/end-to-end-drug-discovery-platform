@@ -30,7 +30,7 @@ module load python/3.11
 module load gcc rdkit
 
 source "$VENV_DIR/bin/activate"
-export OE_LICENSE="${OE_LICENSE:-$HOME/oe_license.txt}"
+export OE_LICENSE="/project/6075065/software/software/2020/Core/openeye/03-2024/oe_license.txt"
 
 echo "========================================"
 echo "Job:         $SLURM_JOB_ID"
