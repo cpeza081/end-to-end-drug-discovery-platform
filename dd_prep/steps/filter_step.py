@@ -94,7 +94,7 @@ class FilterStep(PipelineStep):
 
 
         self.logger.info("Loading library from %s …", input_file)
-        df = pd._load_smiles(input_file, self.logger) # space-separated, two-column format with explicit column names.
+        df = self._load_smiles(input_file, self.logger) # space-separated, two-column format with explicit column names.
         n_raw = len(df) 
         ctx.set("n_molecules_raw", n_raw)
         self.logger.info("  %d molecules loaded.", n_raw)
