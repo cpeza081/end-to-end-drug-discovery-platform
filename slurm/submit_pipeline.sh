@@ -73,7 +73,7 @@ fi
 
 mkdir -p "$PROJECT_DIR/logs"
 
-EXPORTS="DD_PREP_CONFIG=$CONFIG,DD_PREP_VENV=$DD_PREP_VENV"
+EXPORTS="DD_PREP_CONFIG=$CONFIG,DD_PREP_VENV=$DD_PREP_VENV,DD_PREP_PROJECT=$DD_PREP_PROJECT"
 
 echo "=============================================="
 echo "  Deep Docking preparation pipeline"

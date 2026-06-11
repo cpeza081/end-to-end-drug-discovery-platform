@@ -20,7 +20,8 @@ set -euo pipefail
 
 CONFIG="${DD_PREP_CONFIG:?}"
 VENV_DIR="${DD_PREP_VENV:?}"
-SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+# Use DD_PREP_PROJECT to find scripts — BASH_SOURCE[0] points to SLURM spool on compute nodes
+SCRIPT_DIR="$DD_PREP_PROJECT/slurm"
 
 # Read work_dir from config
 WORK_DIR=$(python3 -c "
