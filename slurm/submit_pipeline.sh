@@ -1,128 +1,109 @@
 #!/bin/bash
 # =============================================================================
-# submit_pipeline.sh — Submit the full DD prep pipeline to SLURM.
+# submit_pipeline.sh — Submit the full DD prep pipeline to SLURM
 #
 # Usage:
-#   bash slurm/submit_pipeline.sh --config /path/to/config.yaml
+#   bash slurm/submit_pipeline.sh [--config /path/to/config.yaml]
 #
-# This script submits jobs 1–4 with proper SLURM dependencies so they run
-# in the correct order automatically:
+# If no --config is given, uses the config path saved by setup_cluster.sh.
 #
-#   Job 1 (filter + split)    ──┐
-#   Job 2 (flipper array)     ──┤  afterok:1
-#   Job 3 (tautomers array)   ──┤  afterok:2
-#   Job 4 (organize + FP)     ──┘  afterok:3
+# Job flow:
+#   Job 1 (filter + split)   runs first
+#   Job 2 (coordinator)      waits for job 1, counts chunks, submits:
+#     Job 3 (flipper array)     — one task per chunk
+#     Job 4 (tautomers array)   — waits for flipper
+#     Job 5 (organize + fp)     — waits for tautomers
 #
-# Job 5 (omega) is submitted separately when needed — see --omega flag.
-#
-# Requirements:
-#   • Run 00_setup_env.sh once before this script.
-#   • Set DD_PREP_VENV in your environment or edit VENV_DIR below.
-#   • Edit the --account line in each .sh file to match your PI's account.
-#
+# This means array sizes are always exactly right — no wasted tasks.
 # =============================================================================
 
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-VENV_DIR="${DD_PREP_VENV:-$SCRATCH/dd_prep_venv}"
-SUBMIT_OMEGA=false
-CONFIG=""
-SLURM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# ── Load saved environment from setup_cluster.sh ─────────────────────────────
+ENV_FILE="$PROJECT_DIR/.dd_prep_env"
+if [ -f "$ENV_FILE" ]; then
+    source "$ENV_FILE"
+else
+    echo "ERROR: .dd_prep_env not found."
+    echo "Please run setup first:  bash slurm/setup_cluster.sh"
+    exit 1
+fi
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
+CONFIG="${DD_PREP_CONFIG:-}"
+SUBMIT_OMEGA=false
+
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --config)   CONFIG="$2";      shift 2 ;;
-        --venv)     VENV_DIR="$2";    shift 2 ;;
-        --omega)    SUBMIT_OMEGA=true; shift ;;
+        --config)    CONFIG="$2";      shift 2 ;;
+        --venv)      DD_PREP_VENV="$2"; shift 2 ;;
+        --omega)     SUBMIT_OMEGA=true; shift ;;
         --help|-h)
-            echo "Usage: $0 --config /path/to/config.yaml [--venv /path/to/venv] [--omega]"
-            exit 0
-            ;;
+            echo "Usage: $0 [--config /path/to/config.yaml] [--omega]"
+            exit 0 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
-if [[ -z "$CONFIG" ]]; then
-    echo "ERROR: --config is required."
-    echo "Usage: $0 --config /path/to/config.yaml"
+# ── Validate ──────────────────────────────────────────────────────────────────
+if [ -z "$CONFIG" ]; then
+    echo "ERROR: No config file specified."
+    echo "Run setup_cluster.sh first, or pass --config /path/to/config.yaml"
     exit 1
 fi
 
-CONFIG="$(realpath "$CONFIG")"
-
-if [[ ! -f "$CONFIG" ]]; then
+if [ ! -f "$CONFIG" ]; then
     echo "ERROR: Config file not found: $CONFIG"
     exit 1
 fi
 
-if [[ ! -d "$VENV_DIR" ]]; then
-    echo "ERROR: Virtual environment not found: $VENV_DIR"
-    echo "Run slurm/00_setup_env.sh first."
+if [ -z "${DD_PREP_VENV:-}" ]; then
+    echo "ERROR: DD_PREP_VENV not set. Run setup_cluster.sh first."
     exit 1
 fi
 
-# ── Create logs directory ─────────────────────────────────────────────────────
-mkdir -p logs
+if [ ! -d "$DD_PREP_VENV" ]; then
+    echo "ERROR: Virtual environment not found: $DD_PREP_VENV"
+    echo "Run setup_cluster.sh to recreate it."
+    exit 1
+fi
 
-# ── Export variables for all jobs ─────────────────────────────────────────────
-# sbatch --export passes these into each job's environment.
-EXPORTS="DD_PREP_CONFIG=$CONFIG,DD_PREP_VENV=$VENV_DIR"
+mkdir -p "$PROJECT_DIR/logs"
+
+EXPORTS="DD_PREP_CONFIG=$CONFIG,DD_PREP_VENV=$DD_PREP_VENV"
 
 echo "=============================================="
-echo "Submitting DD prep pipeline"
+echo "  Deep Docking preparation pipeline"
 echo "  Config : $CONFIG"
-echo "  Venv   : $VENV_DIR"
-echo "  Omega  : $SUBMIT_OMEGA"
+echo "  Venv   : $DD_PREP_VENV"
 echo "=============================================="
 
 # ── Job 1: Filter + Split ─────────────────────────────────────────────────────
 JOB1=$(sbatch \
     --export="$EXPORTS" \
     --parsable \
-    "$SLURM_DIR/01_filter_split.sh")
-echo "Submitted Job 1 (filter+split):   $JOB1"
+    "$SCRIPT_DIR/01_filter_split.sh")
+echo "Submitted Job 1 (filter+split):    $JOB1"
 
-# ── Job 2: Flipper array ──────────────────────────────────────────────────────
+# ── Job 2: Coordinator — waits for split, then submits right-sized arrays ─────
 JOB2=$(sbatch \
     --export="$EXPORTS" \
     --dependency="afterok:$JOB1" \
     --parsable \
-    "$SLURM_DIR/02_flipper.sh")
-echo "Submitted Job 2 (flipper array):   $JOB2  [after $JOB1]"
-
-# ── Job 3: Tautomers array ────────────────────────────────────────────────────
-JOB3=$(sbatch \
-    --export="$EXPORTS" \
-    --dependency="afterok:$JOB2" \
-    --parsable \
-    "$SLURM_DIR/03_tautomers.sh")
-echo "Submitted Job 3 (tautomers array): $JOB3  [after $JOB2]"
-
-# ── Job 4: Organize + Fingerprints ───────────────────────────────────────────
-# aftercorr:JOB3 means "after all array tasks of JOB3 have completed".
-JOB4=$(sbatch \
-    --export="$EXPORTS" \
-    --dependency="aftercorr:$JOB3" \
-    --parsable \
-    "$SLURM_DIR/04_organize_fp.sh")
-echo "Submitted Job 4 (organize+fp):     $JOB4  [after all of $JOB3]"
-
-# ── Job 5: Omega (optional) ───────────────────────────────────────────────────
-if $SUBMIT_OMEGA; then
-    JOB5=$(sbatch \
-        --export="$EXPORTS" \
-        --dependency="afterok:$JOB4" \
-        --parsable \
-        "$SLURM_DIR/05_omega.sh")
-    echo "Submitted Job 5 (omega array):     $JOB5  [after $JOB4]"
-fi
+    "$SCRIPT_DIR/coordinator.sh")
+echo "Submitted Job 2 (coordinator):     $JOB2  [after $JOB1]"
 
 echo ""
-echo "All jobs submitted. Monitor with:"
+echo "The coordinator will automatically submit flipper, tautomers,"
+echo "and fingerprint jobs with the correct array sizes once the"
+echo "split step finishes."
+echo ""
+echo "Monitor progress with:"
 echo "  squeue -u \$USER"
-echo "  tail -f logs/01_filter_split_${JOB1}.log"
+echo "  bash slurm/status.sh"
 echo ""
 echo "To cancel everything:"
-echo "  scancel $JOB1 $JOB2 $JOB3 $JOB4"
+echo "  scancel -u \$USER"
