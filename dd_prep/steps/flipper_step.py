@@ -54,6 +54,18 @@ class FlipperStep(PipelineStep):
         n_parallel: int = ctx.get("n_parallel", 4)
         dry_run: bool = ctx.get("dry_run", False)
 
+        # In Slurm array mode, restrict to the one chunk for this task.
+        chunk_index: int | None = ctx.get("chunk_index")
+        if chunk_index is not None:
+            if chunk_index >= len(chunk_files):
+                self.logger.info(
+                    "chunk_index=%d >= total chunks (%d). Nothing to do.",
+                    chunk_index, len(chunk_files),
+                )
+                ctx.set("isom_files", [])
+                return ctx
+            chunk_files = [chunk_files[chunk_index]]
+
         commands: list[list[str]] = []
         isom_files: list[Path] = []
 

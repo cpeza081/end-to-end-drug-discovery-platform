@@ -63,6 +63,18 @@ class TautomerStep(PipelineStep):
         # Use isomer-expanded files if available; fall back to raw chunks.
         input_files: list[Path] = ctx.get("isom_files") or ctx.require("chunk_files")
 
+        # In Slurm array mode, restrict to the one file for this task.
+        chunk_index: int | None = ctx.get("chunk_index")
+        if chunk_index is not None:
+            if chunk_index >= len(input_files):
+                self.logger.info(
+                    "chunk_index=%d >= total files (%d) — nothing to do.",
+                    chunk_index, len(input_files),
+                )
+                ctx.set("state_files", [])
+                return ctx
+            input_files = [input_files[chunk_index]]
+
         commands: list[list[str]] = []
         state_files: list[Path] = []
 

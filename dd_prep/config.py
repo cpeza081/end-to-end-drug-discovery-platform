@@ -167,6 +167,19 @@ class OmegaConfig:
     # Any extra CLI flags passed verbatim to oeomega
     extra_args: str = ""
 
+@dataclass
+class OrganizeConfig:
+    """
+    Collect processed SMILES files into the library_prepared/ directory.
+ 
+    Renames each chunk from its intermediate name (e.g. smiles_all_001_states.smi)
+    to the flat .txt format expected by DD's sampling and fingerprint scripts
+    (e.g. smiles_all_001.txt).
+ 
+    This step has no external dependencies — it is pure file I/O.
+    """
+    enabled: bool = True
+
 
 @dataclass
 class FingerprintConfig:
@@ -237,8 +250,9 @@ class PipelineConfig:
     flipper: FlipperConfig = field(default_factory=FlipperConfig)
     tautomer: TautomerConfig = field(default_factory=TautomerConfig)
     omega: OmegaConfig = field(default_factory=OmegaConfig)
+    organize: OrganizeConfig = field(default_factory=OrganizeConfig)
     fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
-
+    
 
 # ─────────────────────────────────────────────────────────────────────────────#
 #                      Loader helpers

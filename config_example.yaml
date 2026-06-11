@@ -1,0 +1,171 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# dd_prep  —  Deep Docking library preparation pipeline
+# Example configuration file
+#
+# Usage:
+#   dd-prep --config config_example.yaml
+#
+# Every section is optional.  Omitted sections use the defaults shown here.
+# Only set what you want to change.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+
+# Path to the raw SMILES library.
+# Expected format: space-separated, two columns, with header line:
+#   smiles idnumber
+#   CCO    ZINC000001
+#   c1ccccc1 ZINC000002
+input_file: /path/to/your/library.smi
+
+# All intermediate and final outputs are written inside this directory.
+# Created automatically if it does not exist.
+work_dir: ./dd_prep_output
+
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+
+# How many chunk files to process simultaneously for the OpenEye steps
+# (flipper, tautomers, omega).  Set to the number of available CPU cores.
+n_parallel: 4
+
+# If true, skip any step whose output already exists on disk.
+# Set to false to re-run everything from scratch.
+resume: true
+
+# If true, print commands without executing them.  Useful for verifying
+# a configuration on a new cluster before submitting a real job.
+dry_run: false
+
+
+# ── Stage 1: RDKit property filter (optional) ────────────────────────────────
+
+filter:
+  enabled: true
+
+  # Wildman-Crippen logP window.  Targets drug-like lipophilicity.
+  slogp_min: 1.0
+  slogp_max: 3.5
+
+  # Rotatable bond ceiling.  Limits conformational flexibility.
+  rot_bonds_max: 6
+
+  # Exact molecular weight window (Daltons).
+  mw_min: 300.0
+  mw_max: 450.0
+
+  # Fraction of sp3 carbons.  Promotes 3-D character; improves selectivity.
+  fsp3_min: 0.25
+
+  # Aromatic ring count range.
+  aro_rings_min: 1
+  aro_rings_max: 2
+
+  # Aliphatic ring ceiling.
+  aliph_rings_max: 3
+
+  # Total ring count range (aromatic + aliphatic).
+  total_rings_min: 3
+  total_rings_max: 4
+
+  # Only keep neutral molecules (formal charge = 0).
+  formal_charge: 0
+
+
+# ── Stage 2: Split into chunks ───────────────────────────────────────────────
+
+split:
+  # Number of molecules per chunk file.
+  # DD paper recommends 10,000,000.  Lower this on machines with < 32 GB RAM.
+  chunk_size: 10000000
+
+
+# ── Stage 3: OpenEye FLIPPER — stereocentre enumeration ──────────────────────
+
+flipper:
+  enabled: true
+
+  # Append numeric suffix to each isomer name (e.g. ZINC123_1, ZINC123_2).
+  # Required — DD downstream scripts expect unique molecule names.
+  warts: true
+
+  # Enumerate pyramidal (invertible) nitrogens.
+  # Set to true for amine-rich libraries.
+  enum_nitrogen: false
+
+  # Any additional flipper CLI flags, passed verbatim.
+  # Example: "-strict" to require all stereocentres to be specified.
+  extra_args: ""
+
+
+# ── Stage 4: OpenEye TAUTOMERS — protonation states ──────────────────────────
+
+tautomer:
+  enabled: true
+
+  # Number of tautomers to return per molecule.
+  # 1 = dominant tautomer only (recommended for DD).
+  max_to_return: 1
+
+  # Allow methyl tautomerism.  false = recommended by VS prep SOP.
+  ch3: false
+
+  # Append wart suffixes to tautomer names.
+  warts: false
+
+  # Any additional tautomers CLI flags, passed verbatim.
+  extra_args: ""
+
+
+# ── Stage 5: Organise into library_prepared/ ─────────────────────────────────
+
+organize:
+  enabled: true
+  # No further options — this step is pure file renaming / copying.
+
+
+# ── Stage 6: RDKit Morgan fingerprints ───────────────────────────────────────
+
+fingerprint:
+  enabled: true
+
+  # Morgan radius.  DD was trained with radius 2 — do not change.
+  radius: 2
+
+  # Fingerprint bit-vector length.  DD uses 1024 — do not change.
+  n_bits: 1024
+
+  # Number of parallel worker processes for fingerprint calculation.
+  # Set to the number of physical CPU cores for best performance.
+  n_workers: 8
+
+
+# ── Stage 7: OpenEye OMEGA — 3-D conformers (optional) ───────────────────────
+
+omega:
+  # DISABLED by default.  Enable only if you need the full library in 3-D.
+  # For per-iteration docking (normal DD workflow), enable OMEGA separately
+  # on the sampled subsets, not on the full library.
+  enabled: false
+
+  # "classic" = one conformer per molecule (recommended for large VS)
+  # "pose"    = multi-conformer OEB (for FRED docking)
+  mode: classic
+
+  # Maximum number of conformers per molecule.
+  max_confs: 1
+
+  # Enforce strict stereo interpretation.
+  strict_stereo: false
+
+  # Number of MPI processes for OMEGA.
+  mpi_np: 8
+
+  # Output format.
+  # "sdf.gz"  for Glide, AutoDock, most SBDD software
+  # "oeb.gz"  for FRED
+  output_format: sdf.gz
+
+  # Any additional oeomega CLI flags, passed verbatim.
+  extra_args: ""
