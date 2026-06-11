@@ -243,5 +243,7 @@ pip install . --force-reinstall --quiet
 ### Short list of terms
 
 | `PD` | Pending — job is queued and waiting for resources. |
+
 | `R` | Running — job is currently executing. |
+
 | `CG` | Completing — job just finished and SLURM is cleaning up. |
