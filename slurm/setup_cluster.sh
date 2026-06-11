@@ -1,11 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# setup_cluster.sh, an interactive one-time setup wizard for dd_prep
-# 
-# Usage: 
+# setup_cluster.sh — Interactive one-time setup wizard for dd_prep
+#
+# Usage:
 #   bash slurm/setup_cluster.sh
-# 
-# Press Ctrl+C at any time to cancel cleanly
+#
+# Press Ctrl+C at any time to cancel cleanly.
 # =============================================================================
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -63,13 +63,13 @@ echo ""
 
 # ── Step 1: SLURM account ─────────────────────────────────────────────────────
 info "Detecting your SLURM accounts..."
- 
-sacctmgr show associations user=$USER format=account --noheader > /tmp/dd_accounts.txt 2>&1 &
+
+sacctmgr show associations user=$USER format=account%30 --noheader > /tmp/dd_accounts.txt 2>&1 &
 spinner $! "Querying SLURM..."
 wait $!
 
 ACCOUNTS=$(cat /tmp/dd_accounts.txt | tr -d ' ' | grep -v "^$" | sort -u)
- 
+
 if [ -z "$ACCOUNTS" ]; then
     error "No SLURM accounts found. Contact your system administrator."
     exit 1
@@ -89,7 +89,7 @@ ask "Which account should jobs be billed to? Enter number [1]:"
 read -r ACCOUNT_CHOICE
 ACCOUNT_CHOICE="${ACCOUNT_CHOICE:-1}"
 SLURM_ACCOUNT="${ACCOUNT_LIST[$ACCOUNT_CHOICE]}"
- 
+
 if [ -z "$SLURM_ACCOUNT" ]; then
     error "Invalid choice."
     exit 1
@@ -99,7 +99,7 @@ success "Using account: $SLURM_ACCOUNT"
 # ── Step 2: Input SMILES library ──────────────────────────────────────────────
 ask "Full path to your input SMILES library (.smi file):"
 read -r INPUT_FILE
- 
+
 if [ -f "$INPUT_FILE" ]; then
     N_MOLS=$(wc -l < "$INPUT_FILE")
     success "Found library (~$N_MOLS lines)."
@@ -149,7 +149,7 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 source "$VENV_DIR/bin/activate"
- 
+
 # pip install with live output (no --quiet) so progress is visible
 info "Upgrading pip..."
 pip install --upgrade pip 2>&1 | while IFS= read -r line; do
@@ -176,48 +176,56 @@ python -c "import rdkit, dd_prep, pandas, yaml" 2>/dev/null \
     && success "All imports verified (rdkit, dd_prep, pandas, yaml)." \
     || { error "Import verification failed. Check output above."; exit 1; }
 
-
 # ── Step 5: OpenEye ───────────────────────────────────────────────────────────
 echo ""
-info "Searching for OpenEye binaries..."
- 
-# Run find in background with spinner
-find /project /opt /software 2>/dev/null \
-    -name "flipper" \
-    -not -path "*/arch/*" \
-    -not -path "*/omega/*" \
-    > /tmp/dd_oe_bin.txt 2>/dev/null &
-spinner $! "Searching filesystem for OpenEye..."
-wait $! || true
+info "OpenEye configuration"
+echo "  OpenEye is required for the flipper and tautomers steps."
+echo "  Press Enter to skip if you don't have OpenEye access."
+echo ""
 
-OE_BIN=$(head -1 /tmp/dd_oe_bin.txt | xargs -I{} dirname {} 2>/dev/null || true)
- 
-if [ -n "$OE_BIN" ]; then
-    success "Found OpenEye binaries: $OE_BIN"
+ask "Auto-detect OpenEye installation? This searches the filesystem and may take 1-2 minutes. (Y/n):"
+read -r OE_AUTO
+OE_BIN=""
+OE_LIC=""
+
+if [[ ! "$OE_AUTO" =~ ^[Nn]$ ]]; then
+    # Auto-detect
+    info "Searching for OpenEye binaries..."
+    find /project /opt /software 2>/dev/null         -name "flipper"         -not -path "*/arch/*"         -not -path "*/omega/*"         > /tmp/dd_oe_bin.txt 2>/dev/null &
+    spinner $! "Searching filesystem for OpenEye (Ctrl+C to cancel and enter manually)..."
+    wait $! || true
+    OE_BIN=$(head -1 /tmp/dd_oe_bin.txt | xargs -I{} dirname {} 2>/dev/null || true)
+
+    if [ -n "$OE_BIN" ]; then
+        success "Found OpenEye binaries: $OE_BIN"
+    else
+        warn "Could not find OpenEye binaries automatically."
+        ask "Enter path to OpenEye bin directory manually (or press Enter to skip):"
+        read -r OE_BIN_INPUT
+        OE_BIN="${OE_BIN_INPUT:-}"
+    fi
+
+    info "Searching for OpenEye licence..."
+    find /project /opt /home/$USER 2>/dev/null         -name "oe_license.txt"         -not -path "*/arch/*"         -not -name "*.bak*"         > /tmp/dd_oe_lic.txt 2>/dev/null &
+    spinner $! "Searching for licence file (Ctrl+C to cancel and enter manually)..."
+    wait $! || true
+    OE_LIC=$(head -1 /tmp/dd_oe_lic.txt || true)
+
+    if [ -n "$OE_LIC" ]; then
+        success "Found OpenEye licence: $OE_LIC"
+    else
+        warn "Could not find licence file automatically."
+        ask "Enter path to oe_license.txt manually (or press Enter to skip):"
+        read -r OE_LIC_INPUT
+        OE_LIC="${OE_LIC_INPUT:-}"
+    fi
 else
-    warn "Could not auto-detect OpenEye binaries."
-    ask "Enter the full path to your OpenEye bin directory (or press Enter to skip):"
+    # Manual entry
+    ask "Path to OpenEye bin directory (contains flipper, tautomers):"
     read -r OE_BIN_INPUT
     OE_BIN="${OE_BIN_INPUT:-}"
-fi
 
-info "Searching for OpenEye licence..."
-find /project /opt /home/$USER 2>/dev/null \
-    -maxdepth 6 \
-    -name "oe_license.txt" \
-    -not -path "*/arch/*" \
-    -not -name "*.bak*" \
-    > /tmp/dd_oe_lic.txt 2>/dev/null &
-spinner $! "Searching for licence file..."
-wait $! || true
-
-OE_LIC=$(head -1 /tmp/dd_oe_lic.txt || true)
- 
-if [ -n "$OE_LIC" ]; then
-    success "Found OpenEye licence: $OE_LIC"
-else
-    warn "Could not auto-detect OpenEye licence."
-    ask "Enter the full path to oe_license.txt (or press Enter to skip):"
+    ask "Path to oe_license.txt:"
     read -r OE_LIC_INPUT
     OE_LIC="${OE_LIC_INPUT:-}"
 fi
@@ -232,7 +240,7 @@ if [ -n "$OE_BIN" ] && [ -n "$OE_LIC" ] && [ -f "$OE_LIC" ]; then
 fi
 
 [ "$OE_WORKS" = false ] && warn "Flipper/tautomers will be disabled in the config. Enable them later once OpenEye is set up."
- 
+
 # ── Step 6: Update SLURM scripts ─────────────────────────────────────────────
 info "Updating SLURM scripts..."
 for f in "$SCRIPT_DIR"/*.sh; do
@@ -252,28 +260,28 @@ export DD_PREP_VENV="$VENV_DIR"
 export DD_PREP_PROJECT="$PROJECT_DIR"
 ENVEOF
 success "Environment saved to .dd_prep_env"
- 
+
 # ── Step 8: Generate config ───────────────────────────────────────────────────
 CONFIG_FILE="$PROJECT_DIR/my_run.yaml"
- 
+
 if [ -f "$CONFIG_FILE" ]; then
     ask "Config already exists at $CONFIG_FILE. Overwrite? (y/N):"
     read -r OW
     [[ "$OW" =~ ^[Yy]$ ]] || CONFIG_FILE="$PROJECT_DIR/my_run_$(date +%Y%m%d_%H%M%S).yaml"
 fi
- 
+
 FLIPPER_ENABLED=$( [ "$OE_WORKS" = true ] && echo "true" || echo "false" )
 TAUTOMER_ENABLED=$( [ "$OE_WORKS" = true ] && echo "true" || echo "false" )
- 
+
 cat > "$CONFIG_FILE" << YAML
 # dd_prep configuration — generated $(date)
- 
+
 input_file: $INPUT_FILE
 work_dir:   $WORK_DIR
- 
+
 n_parallel: 4
 resume: true
- 
+
 filter:
   enabled: true
   slogp_min: 1.0
@@ -288,35 +296,35 @@ filter:
   total_rings_min: 3
   total_rings_max: 4
   formal_charge: 0
- 
+
 split:
   chunk_size: 10000000
- 
+
 flipper:
   enabled: $FLIPPER_ENABLED
   warts: true
   enum_nitrogen: false
- 
+
 tautomer:
   enabled: $TAUTOMER_ENABLED
   max_to_return: 1
   ch3: false
- 
+
 organize:
   enabled: true
- 
+
 fingerprint:
   enabled: true
   radius: 2
   n_bits: 1024
   n_workers: 16
- 
+
 omega:
   enabled: false
 YAML
- 
+
 success "Config written to: $CONFIG_FILE"
- 
+
 # ── Step 9: Validate ──────────────────────────────────────────────────────────
 echo ""
 info "Running validation..."
@@ -324,7 +332,7 @@ dd-prep --config "$CONFIG_FILE" --validate-only 2>&1 \
     | grep -v "No chunk\|No input\|No processed\|No prepared" \
     || true
 success "Setup complete."
- 
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}============================================================${RESET}"
