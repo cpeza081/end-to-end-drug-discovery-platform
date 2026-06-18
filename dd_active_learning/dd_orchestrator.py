@@ -4,14 +4,15 @@ dd_orchestrator.py
 ==================
 Deep Docking active-learning campaign orchestrator.
 
-Reads a YAML config file and drives the DD loop:
+Reads a YAML config file and drives the full DD loop:
   Iteration 1:  Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
   Iteration N:  Phase 1 (from previous predictions) → Phase 2 → 3 → 4 → 5
   Final:        extract SMILES of surviving virtual hits
 
 The orchestrator submits one job per phase, using the scheduler's native
-dependency mechanism. All job IDs are logged to <project_dir>/campaign_state.json 
-so a crashed run can be resumed from the last completed phase.
+dependency mechanism so phases run in sequence without polling.  All job IDs
+are logged to <project_dir>/campaign_state.json so a crashed run can be
+resumed from the last completed phase.
 
 Scheduler support
 -----------------
@@ -33,38 +34,12 @@ Usage
 
 import argparse
 import json
-import os
 import subprocess
-import sys
 import textwrap
 from datetime import datetime
 from pathlib import Path
 
-import yaml  # pip install pyyaml
-
-
-# =============================================================================
-# Config loading & path expansion
-# =============================================================================
-
-def load_config(path: str) -> dict:
-    """Load YAML config, expanding environment variables in string values."""
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-    return _expand_env(raw)
-
-# We expand environment variables (name/value pair that operating system keeps for current shell or process).
-# Programs can read them to find settings like file locations, tool paths, or runtime options. In this case,
-# we let the YAML config refer to values like $HOME or ${DATA_DIR} without hardcoding them. 
-def _expand_env(obj):
-    """Recursively expand $VAR / ${VAR} in all string values."""
-    if isinstance(obj, dict):
-        return {k: _expand_env(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env(i) for i in obj]
-    if isinstance(obj, str):
-        return os.path.expandvars(obj)
-    return obj
+from dd_utils import load_config
 
 
 # =============================================================================
@@ -73,8 +48,9 @@ def _expand_env(obj):
 
 class CampaignState:
     """
-    Tracks which phases have been submitted / completed and stores job IDs.
-    Written to <project_dir>/campaign_state.json after every submission.
+    Tracks which phases have been submitted and stores their job IDs.
+    Written to <project_dir>/campaign_state.json after every submission,
+    so a crashed run can be resumed without re-submitting completed phases.
     """
 
     def __init__(self, project_dir: str):
@@ -87,13 +63,11 @@ class CampaignState:
                 return json.load(f)
         return {"iterations": {}, "submitted_at": str(datetime.now())}
 
-    # We save the state after every job submission.
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w") as f:
             json.dump(self.data, f, indent=2)
 
-    # When we submit a job, we record its ID and timestamp as well as iteration and phase.
     def record_job(self, iteration: int, phase: int, job_id: str):
         key = str(iteration)
         self.data["iterations"].setdefault(key, {})
@@ -101,13 +75,11 @@ class CampaignState:
         self.data["iterations"][key][f"phase{phase}_submitted"] = str(datetime.now())
         self.save()
 
-    # When resuming, we can look up the last submitted job ID for a given iteration and phase to chain the next job from. 
     def get_job_id(self, iteration: int, phase: int) -> str | None:
         return (self.data["iterations"]
                 .get(str(iteration), {})
                 .get(f"phase{phase}_job_id"))
 
-    # This allows us to check if a phase has already been submitted, so we don't accidentally submit duplicate jobs when resuming. 
     def is_phase_submitted(self, iteration: int, phase: int) -> bool:
         return self.get_job_id(iteration, phase) is not None
 
@@ -124,18 +96,17 @@ class Scheduler:
     """
 
     def __init__(self, stype: str, account: str, dry_run: bool = False):
-        self.stype = stype.upper() # Convert scheduler type to uppercase for consistency (e.g., "slurm" → "SLURM")
+        self.stype = stype.upper()
         self.account = account
         self.dry_run = dry_run
         if self.stype not in ("SLURM", "PBS", "SGE"):
-            raise ValueError(f"Unsupported scheduler: {stype}")
+            raise ValueError(f"Unsupported scheduler: {stype}. "
+                             f"Choose from: SLURM, PBS, SGE")
 
-    # ------------------------------------------------------------------
-    # Submit a script, optionally depending on a previous job ID.
-    # Returns the new job ID string.
-    # ------------------------------------------------------------------
     def submit(self, script_path: str, depends_on: str | None = None) -> str:
-        cmd = self._build_submit_cmd(script_path, depends_on) # Build the appropriate submission command based on the scheduler type and dependency. 
+        """Submit a script, optionally depending on a previous job ID.
+        Returns the new job ID string."""
+        cmd = self._build_submit_cmd(script_path, depends_on)
         print(f"  Submitting: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -143,57 +114,59 @@ class Scheduler:
             print(f"  [dry-run] Would submit → fake job ID: {fake_id}")
             return fake_id
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True) # Execute the submission command and capture the output, which contains the job ID assigned by the scheduler. 
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         job_id = self._parse_job_id(result.stdout.strip())
         print(f"  → Job ID: {job_id}")
         return job_id
 
     def _build_submit_cmd(self, script: str, depends_on: str | None) -> list[str]:
-        """Construct the appropriate submission command based on the scheduler type and dependency."""
-
-        # Builds command used to submit a job script to the scheduler. 
+        # FIX: previously the SGE branch had no explicit return, relying on
+        # fall-through to a bare `return cmd` that didn't exist.  Each branch
+        # now returns explicitly, making the control flow unambiguous.
         if self.stype == "SLURM":
-            cmd = ["sbatch"] # starts the command with the submit tool for SLURM.
-            if depends_on: # Checks whether this job should wait for another job first (i.e., if depends_on is not None).
-                cmd += [f"--dependency=afterok:{depends_on}"] # Adds a dependency option so this job only runs after the named job succeeds.
-            cmd.append(script) # Adds the script file path to the command. 
+            cmd = ["sbatch"]
+            if depends_on:
+                cmd += [f"--dependency=afterok:{depends_on}"]
+            cmd.append(script)
+            return cmd
 
-        elif self.stype == "PBS":
+        if self.stype == "PBS":
             cmd = ["qsub"]
             if depends_on:
-                cmd += [f"-W", f"depend=afterok:{depends_on}"]
+                cmd += ["-W", f"depend=afterok:{depends_on}"]
             cmd.append(script)
+            return cmd
 
-        elif self.stype == "SGE":
-            cmd = ["qsub"]
-            if depends_on:
-                cmd += ["-hold_jid", depends_on]
-            cmd.append(script)
-
+        # SGE
+        cmd = ["qsub"]
+        if depends_on:
+            cmd += ["-hold_jid", depends_on]
+        cmd.append(script)
         return cmd
 
     def _parse_job_id(self, stdout: str) -> str:
-        """Extract numeric job ID from submission output."""
+        """Extract the numeric job ID from the scheduler's submission output."""
         if self.stype == "SLURM":
-            # "Submitted batch job 12345"
-            return stdout.split()[-1]
-        elif self.stype == "PBS":
-            # "12345.cluster"
-            return stdout.split(".")[0]
-        elif self.stype == "SGE":
-            # "Your job 12345 (\"name\") has been submitted"
-            return stdout.split()[2]
-        return stdout
+            return stdout.split()[-1]       # "Submitted batch job 12345"
+        if self.stype == "PBS":
+            return stdout.split(".")[0]     # "12345.cluster.name"
+        # SGE: "Your job 12345 ("name") has been submitted"
+        return stdout.split()[2]
 
-    # ------------------------------------------------------------------
-    # Generate the scheduler header block for a job script
-    # ------------------------------------------------------------------
     def header(self, job_name: str, walltime: str, nodes: int,
                cpus: int, mem: str, gpus: int, account: str,
                partition: str, log_dir: str) -> str:
+        """Return the scheduler-specific resource header for a job script."""
+        # FIX: gpu_line is omitted entirely (not just set to "") when gpus == 0,
+        # so the generated script header doesn't contain a stray blank line.
+        gpu_lines = {
+            "SLURM": f"#SBATCH --gres=gpu:{gpus}",
+            "PBS":   f"#PBS -l ngpus={gpus}",
+            "SGE":   f"#$ -l gpu={gpus}",
+        }
+        gpu_line = (gpu_lines[self.stype] + "\n") if gpus > 0 else ""
 
         if self.stype == "SLURM":
-            gpu_line = f"#SBATCH --gres=gpu:{gpus}" if gpus > 0 else ""
             return textwrap.dedent(f"""\
                 #!/bin/bash
                 #SBATCH --job-name={job_name}
@@ -205,11 +178,9 @@ class Scheduler:
                 #SBATCH --time={walltime}
                 #SBATCH --output={log_dir}/{job_name}_%j.out
                 #SBATCH --error={log_dir}/{job_name}_%j.err
-                {gpu_line}
-            """).rstrip()
+                {gpu_line}""")
 
-        elif self.stype == "PBS":
-            gpu_line = f"#PBS -l ngpus={gpus}" if gpus > 0 else ""
+        if self.stype == "PBS":
             return textwrap.dedent(f"""\
                 #!/bin/bash
                 #PBS -N {job_name}
@@ -220,28 +191,36 @@ class Scheduler:
                 #PBS -l walltime={walltime}
                 #PBS -o {log_dir}/{job_name}.out
                 #PBS -e {log_dir}/{job_name}.err
-                {gpu_line}
-            """).rstrip()
+                {gpu_line}""")
 
-        elif self.stype == "SGE":
-            gpu_line = f"#$ -l gpu={gpus}" if gpus > 0 else ""
-            return textwrap.dedent(f"""\
-                #!/bin/bash
-                #$ -N {job_name}
-                #$ -A {account}
-                #$ -q {partition}
-                #$ -pe smp {cpus}
-                #$ -l h_vmem={mem}
-                #$ -l h_rt={walltime}
-                #$ -o {log_dir}/{job_name}.out
-                #$ -e {log_dir}/{job_name}.err
-                {gpu_line}
-            """).rstrip()
+        # SGE
+        return textwrap.dedent(f"""\
+            #!/bin/bash
+            #$ -N {job_name}
+            #$ -A {account}
+            #$ -q {partition}
+            #$ -pe smp {cpus}
+            #$ -l h_vmem={mem}
+            #$ -l h_rt={walltime}
+            #$ -o {log_dir}/{job_name}.out
+            #$ -e {log_dir}/{job_name}.err
+            {gpu_line}""")
 
 
 # =============================================================================
 # Job script generators  (one per phase)
 # =============================================================================
+
+# Phase metadata used both for submission ordering and status display.
+# Defined once at module level so it isn't rebuilt on every run() call.
+PHASES = {
+    1: "Sampling",
+    2: "Ligand prep",
+    3: "Docking",
+    4: "Training",
+    5: "Inference",
+}
+
 
 class JobScriptFactory:
     """
@@ -254,29 +233,26 @@ class JobScriptFactory:
         self.cfg = cfg
         self.s = scheduler
 
-        # Frequently referenced config sub-trees
-        self.dd = cfg["dd"]
-        self.env = cfg["env"]
-        self.dock = cfg["docking"]
-        self.proj = cfg["project_dir"]
-        self.lib = cfg["library"]
-        self.res = cfg["scheduler"]["resources"]
-        self.wt = cfg["scheduler"]["walltime"]
-        self.sched = cfg["scheduler"]
-        self.name = cfg["campaign_name"]
+        # FIX: previously the constructor unpacked config into short aliases
+        # (self.dd, self.env, …) AND every method re-bound those to local
+        # variables anyway, giving two levels of indirection with no benefit.
+        # Now we hold the full config and let each method reach into it directly
+        # with clear, self-documenting keys.  One level, no aliases.
+        self.proj   = cfg["project_dir"]
+        self.name   = cfg["campaign_name"]
 
     # ------------------------------------------------------------------
     # Shared preamble written at the top of every script
     # ------------------------------------------------------------------
     def _preamble(self, iteration: int) -> str:
-        oe_dir = self.env["openeye_dir"]
-        conda_env = self.env["conda_env"]
-        dd_dir = self.env["dd_protocol_dir"]
-        project_dir = self.proj
+        oe_dir    = self.cfg["env"]["openeye_dir"]
+        conda_env = self.cfg["env"]["conda_env"]
+        dd_dir    = self.cfg["env"]["dd_protocol_dir"]
+
         return textwrap.dedent(f"""\
 
             # ── Environment setup ──────────────────────────────────────────
-            export DD_PROJECT_DIR="{project_dir}"
+            export DD_PROJECT_DIR="{self.proj}"
             export DD_ITERATION={iteration}
             export DD_CAMPAIGN="{self.name}"
             export PATH="{oe_dir}:$PATH"
@@ -287,49 +263,50 @@ class JobScriptFactory:
             source "$(conda info --base)/etc/profile.d/conda.sh"
             conda activate "{conda_env}"
 
-            # Abort on any error
+            # Abort immediately if any command fails — this ensures the
+            # scheduler marks the job as FAILED rather than silently
+            # continuing into a broken state, which would break the
+            # dependency chain for subsequent phases.
             set -euo pipefail
 
             echo "[$(date)] Starting iteration ${{DD_ITERATION}}"
         """)
 
+    def _make_header(self, phase_key: str, job_name: str,
+                     partition_key: str) -> str:
+        """Build the scheduler header for any phase using config lookups."""
+        r   = self.cfg["scheduler"]["resources"][phase_key]
+        wt  = self.cfg["scheduler"]["walltime"][phase_key]
+        acc = self.cfg["scheduler"]["account"]
+        par = self.cfg["scheduler"][partition_key]
+        log = f"{self.proj}/logs"
+        return self.s.header(job_name, wt, r["nodes"], r["cpus"],
+                             r["mem"], r["gpus"], acc, par, log)
+
     # ------------------------------------------------------------------
     # Phase 1: Random sampling from library (iter 1) or predictions (iter N>1)
     # ------------------------------------------------------------------
     def phase1_sampling(self, iteration: int) -> str:
-        r = self.res["phase1_sampling"]
-        partition = self.sched["cpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_i{iteration:02d}_p1_sampling"
+        header   = self._make_header("phase1_sampling", job_name, "cpu_partition")
+
+        dd_dir   = self.cfg["env"]["dd_protocol_dir"]
+        ncpu     = self.cfg["scheduler"]["resources"]["phase1_sampling"]["cpus"]
+        fp_dir   = self.cfg["library"]["fingerprint_dir"]
+        smi_dir  = self.cfg["library"]["smiles_dir"]
+        train_sz = self.cfg["dd"]["train_size"]
+        val_sz   = self.cfg["dd"]["val_size"]
 
         # In iteration 1 we sample from the full fingerprint library.
-        # In subsequent iterations we sample from the previous iteration's
-        # predicted virtual hits (morgan_1024_predictions folder).
+        # In subsequent iterations we sample only from the previous iteration's
+        # virtual-hit predictions — validation and test sets are frozen after
+        # iteration 1 and reused throughout (see paper §'Molecular sample size').
         if iteration == 1:
-            data_dir = self.lib["fingerprint_dir"]
-            tot_sampling = self.dd["train_size"] + 2 * self.dd["val_size"]
+            data_dir     = fp_dir
+            tot_sampling = train_sz + 2 * val_sz
         else:
-            prev = iteration - 1
-            data_dir = (f"{self.proj}/iteration_{prev:02d}"
-                        f"/morgan_1024_predictions")
-            # After iteration 1, only augment training; val/test stay fixed
-            tot_sampling = self.dd["train_size"]
-
-        proj_dir = self.proj
-        proj_name = self.name
-        dd_dir = self.env["dd_protocol_dir"]
-        ncpu = r["cpus"]
-        train_sz = self.dd["train_size"]
-        val_sz = self.dd["val_size"]
-        fp_dir = self.lib["fingerprint_dir"]
-        smiles_dir = self.lib["smiles_dir"]
-
-        header = self.s.header(
-            job_name, self.wt["phase1_sampling"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
+            data_dir     = f"{self.proj}/iteration_{iteration - 1:02d}/morgan_1024_predictions"
+            tot_sampling = train_sz   # only augment training; val/test are fixed
 
         body = textwrap.dedent(f"""\
 
@@ -338,12 +315,12 @@ class JobScriptFactory:
             # then perform the actual random sampling, deduplicate, and extract
             # both Morgan fingerprints and SMILES for the sampled molecules.
 
-            ITER_DIR="{proj_dir}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
             mkdir -p "$ITER_DIR"
 
             # Step 1a: count molecules per file to reach target sample size
             python "{dd_dir}/scripts_1/molecular_file_count_updated.py" \\
-                --project_name "{proj_name}" \\
+                --project_name "{self.name}" \\
                 --n_iteration {iteration} \\
                 --data_directory "{data_dir}" \\
                 --tot_process {ncpu} \\
@@ -351,8 +328,8 @@ class JobScriptFactory:
 
             # Step 1b: perform the random sampling
             python "{dd_dir}/scripts_1/sampling.py" \\
-                --project_name "{proj_name}" \\
-                --file_path "{proj_dir}" \\
+                --project_name "{self.name}" \\
+                --file_path "{self.proj}" \\
                 --n_iteration {iteration} \\
                 --data_directory "{data_dir}" \\
                 --tot_process {ncpu} \\
@@ -361,24 +338,24 @@ class JobScriptFactory:
 
             # Step 1c: remove overlaps between train / val / test sets
             python "{dd_dir}/scripts_1/sanity_check.py" \\
-                --project_name "{proj_name}" \\
-                --file_path "{proj_dir}" \\
+                --project_name "{self.name}" \\
+                --file_path "{self.proj}" \\
                 --n_iteration {iteration}
 
             # Step 1d: extract Morgan fingerprints for sampled molecules
             python "{dd_dir}/scripts_1/extracting_morgan.py" \\
-                --project_name "{proj_name}" \\
-                --file_path "{proj_dir}" \\
+                --project_name "{self.name}" \\
+                --file_path "{self.proj}" \\
                 --n_iteration {iteration} \\
                 --morgan_directory "{fp_dir}" \\
                 --tot_process {ncpu}
 
             # Step 1e: extract SMILES for sampled molecules
             python "{dd_dir}/scripts_1/extracting_smiles.py" \\
-                --project_name "{proj_name}" \\
-                --file_path "{proj_dir}" \\
+                --project_name "{self.name}" \\
+                --file_path "{self.proj}" \\
                 --n_iteration {iteration} \\
-                --smile_directory "{smiles_dir}" \\
+                --smile_directory "{smi_dir}" \\
                 --tot_process {ncpu}
 
             echo "[$(date)] Phase 1 complete — iteration {iteration}"
@@ -390,19 +367,15 @@ class JobScriptFactory:
     # Phase 2: 3D conformer generation with OMEGA
     # ------------------------------------------------------------------
     def phase2_ligand_prep(self, iteration: int) -> str:
-        r = self.res["phase2_ligand_prep"]
-        partition = self.sched["cpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_i{iteration:02d}_p2_ligprep"
-        program = self.dock["program"].upper()
-        proj_dir = self.proj
-        ncpu = r["cpus"]
+        header   = self._make_header("phase2_ligand_prep", job_name, "cpu_partition")
+        program  = self.cfg["docking"]["program"].upper()
+        ncpu     = self.cfg["scheduler"]["resources"]["phase2_ligand_prep"]["cpus"]
 
-        # Ligand prep output format differs by docking program
+        # OMEGA command differs by docking program:
+        #   FRED  → pose mode, outputs .oeb.gz (receptor-filtered conformers)
+        #   GLIDE → classic mode, outputs .sdf  (one conformer per molecule)
         if program == "FRED":
-            # OMEGA pose mode → oeb.gz  (pose mode generates multiple conformers
-            # pre-filtered for receptor shape — best for FRED)
             omega_cmd = textwrap.dedent(f"""\
                 # Generate 3D conformers in OMEGA pose mode (for FRED docking)
                 for SMI_FILE in "$ITER_DIR/smile/"*.smi; do
@@ -415,7 +388,6 @@ class JobScriptFactory:
                 done
             """)
         elif program == "GLIDE":
-            # OMEGA classic mode → sdf  (one conformer per molecule)
             omega_cmd = textwrap.dedent(f"""\
                 # Generate 3D conformers in OMEGA classic mode (for GLIDE docking)
                 for SMI_FILE in "$ITER_DIR/smile/"*.smi; do
@@ -429,13 +401,8 @@ class JobScriptFactory:
                 done
             """)
         else:
-            raise ValueError(f"Unknown docking program: {program}")
-
-        header = self.s.header(
-            job_name, self.wt["phase2_ligand_prep"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
+            raise ValueError(f"Unknown docking program: {program}. "
+                             f"Choose FRED or GLIDE.")
 
         body = textwrap.dedent(f"""\
 
@@ -443,7 +410,7 @@ class JobScriptFactory:
             # OMEGA enumerates low-energy 3D conformations from the 2D SMILES.
             # These conformers are required as input to the docking program.
 
-            ITER_DIR="{proj_dir}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
             mkdir -p "$ITER_DIR/sdf"
 
         """) + omega_cmd + textwrap.dedent(f"""\
@@ -457,15 +424,11 @@ class JobScriptFactory:
     # Phase 3: Docking
     # ------------------------------------------------------------------
     def phase3_docking(self, iteration: int) -> str:
-        r = self.res["phase3_docking"]
-        partition = self.sched["cpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_i{iteration:02d}_p3_docking"
-        program = self.dock["program"].upper()
-        grid = self.dock["grid_file"]
-        proj_dir = self.proj
-        ncpu = r["cpus"]
+        header   = self._make_header("phase3_docking", job_name, "cpu_partition")
+        program  = self.cfg["docking"]["program"].upper()
+        grid     = self.cfg["docking"]["grid_file"]
+        ncpu     = self.cfg["scheduler"]["resources"]["phase3_docking"]["cpus"]
 
         if program == "FRED":
             docking_cmd = textwrap.dedent(f"""\
@@ -481,13 +444,13 @@ class JobScriptFactory:
                 done
             """)
         elif program == "GLIDE":
-            dd_dir = self.env["dd_protocol_dir"]
-            glide_tmpl = self.dock.get("glide_template", "")
+            dd_dir      = self.cfg["env"]["dd_protocol_dir"]
+            glide_tmpl  = self.cfg["docking"].get("glide_template", "")
             docking_cmd = textwrap.dedent(f"""\
                 # Generate GLIDE input scripts, then dock
                 python "{dd_dir}/scripts_1/input_glide.py" \\
                     --project_name "{self.name}" \\
-                    --file_path "{proj_dir}" \\
+                    --file_path "{self.proj}" \\
                     --grid_file "{grid}" \\
                     --iteration_no {iteration} \\
                     --glide_input "{glide_tmpl}"
@@ -498,13 +461,8 @@ class JobScriptFactory:
                 done
             """)
         else:
-            raise ValueError(f"Unknown docking program: {program}")
-
-        header = self.s.header(
-            job_name, self.wt["phase3_docking"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
+            raise ValueError(f"Unknown docking program: {program}. "
+                             f"Choose FRED or GLIDE.")
 
         body = textwrap.dedent(f"""\
 
@@ -514,7 +472,7 @@ class JobScriptFactory:
             # Outputs one SDF file per input set inside the "docked" folder.
             # The SDF must contain the docking score field used in Phase 4.
 
-            ITER_DIR="{proj_dir}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
             mkdir -p "$ITER_DIR/docked"
 
         """) + docking_cmd + textwrap.dedent(f"""\
@@ -528,33 +486,26 @@ class JobScriptFactory:
     # Phase 4: DNN model training
     # ------------------------------------------------------------------
     def phase4_training(self, iteration: int) -> str:
-        r = self.res["phase4_training"]
-        partition = self.sched["gpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_i{iteration:02d}_p4_training"
+        header   = self._make_header("phase4_training", job_name, "gpu_partition")
 
-        dd_dir = self.env["dd_protocol_dir"]
-        proj_dir = self.proj
-        fp_dir = self.lib["fingerprint_dir"]
-        score_kw = self.dock["score_keyword"]
-        total_iter = self.dd["total_iterations"]
-        num_models = self.dd["num_models"]
-        val_sz = self.dd["val_size"]
-        pct_first = self.dd["percent_first"]
-        pct_last = self.dd["percent_last"]
-        recall = self.dd["recall"]
-        is_last = str(iteration == total_iter).capitalize()  # "True" / "False"
+        dd_dir     = self.cfg["env"]["dd_protocol_dir"]
+        fp_dir     = self.cfg["library"]["fingerprint_dir"]
+        score_kw   = self.cfg["docking"]["score_keyword"]
+        total_iter = self.cfg["dd"]["total_iterations"]
+        num_models = self.cfg["dd"]["num_models"]
+        val_sz     = self.cfg["dd"]["val_size"]
+        pct_first  = self.cfg["dd"]["percent_first"]
+        pct_last   = self.cfg["dd"]["percent_last"]
+        recall     = self.cfg["dd"]["recall"]
 
-        # How many docking SDF files exist — one per molecular set
-        # (train + val + test = 3 in iter 1; just train in later iters)
+        # is_last controls whether the final score threshold is applied.
+        # Python's bool → str gives "True"/"False" which the DD script expects.
+        is_last = str(iteration == total_iter)
+
+        # Iteration 1 docks train + val + test (3 SDF files);
+        # later iterations dock only the training augmentation batch (1 file).
         n_docking_files = 3 if iteration == 1 else 1
-
-        header = self.s.header(
-            job_name, self.wt["phase4_training"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
 
         body = textwrap.dedent(f"""\
 
@@ -567,12 +518,12 @@ class JobScriptFactory:
             # The DNN learns to predict docking scores from Morgan fingerprints,
             # enabling fast inference over the full library in Phase 5.
 
-            ITER_DIR="{proj_dir}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
 
             # Step 4a: convert SDF docking scores → binary label files
             python "{dd_dir}/scripts_2/extract_labels.py" \\
                 --project_name "{self.name}" \\
-                --file_path "{proj_dir}" \\
+                --file_path "{self.proj}" \\
                 --iteration_no {iteration} \\
                 --tot_process {n_docking_files} \\
                 --score_keyword '{score_kw}'
@@ -581,7 +532,7 @@ class JobScriptFactory:
             python "{dd_dir}/scripts_2/simple_job_models_manual.py" \\
                 --iteration_no {iteration} \\
                 --morgan_directory "{fp_dir}" \\
-                --file_path "{proj_dir}/{self.name}" \\
+                --file_path "{self.proj}/{self.name}" \\
                 --number_of_hyp {num_models} \\
                 --total_iterations {total_iter} \\
                 --is_last {is_last} \\
@@ -599,7 +550,7 @@ class JobScriptFactory:
             # Step 4d: grid search — select the best model by test-set precision
             python "{dd_dir}/scripts_2/hyperparameter_result_evaluation.py" \\
                 --n_iteration {iteration} \\
-                --data_path "{proj_dir}/{self.name}" \\
+                --data_path "{self.proj}/{self.name}" \\
                 --morgan_directory "{fp_dir}" \\
                 --number_mol {val_sz} \\
                 --recall {recall}
@@ -615,22 +566,12 @@ class JobScriptFactory:
     # Phase 5: Inference over the full library
     # ------------------------------------------------------------------
     def phase5_inference(self, iteration: int) -> str:
-        r = self.res["phase5_inference"]
-        partition = self.sched["gpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_i{iteration:02d}_p5_inference"
+        header   = self._make_header("phase5_inference", job_name, "gpu_partition")
 
-        dd_dir = self.env["dd_protocol_dir"]
-        proj_dir = self.proj
-        fp_dir = self.lib["fingerprint_dir"]
-        recall = self.dd["recall"]
-
-        header = self.s.header(
-            job_name, self.wt["phase5_inference"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
+        dd_dir = self.cfg["env"]["dd_protocol_dir"]
+        fp_dir = self.cfg["library"]["fingerprint_dir"]
+        recall = self.cfg["dd"]["recall"]
 
         body = textwrap.dedent(f"""\
 
@@ -642,12 +583,12 @@ class JobScriptFactory:
             # morgan_1024_predictions/ — this becomes the sampling pool for
             # the next iteration's Phase 1.
 
-            ITER_DIR="{proj_dir}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
 
             # Step 5a: generate one inference script per fingerprint chunk
             python "{dd_dir}/scripts_2/simple_job_predictions_manual.py" \\
                 --project_name "{self.name}" \\
-                --file_path "{proj_dir}" \\
+                --file_path "{self.proj}" \\
                 --n_iteration {iteration} \\
                 --morgan_directory "{fp_dir}"
 
@@ -670,22 +611,12 @@ class JobScriptFactory:
     # Final phase: extract SMILES of surviving virtual hits for final docking
     # ------------------------------------------------------------------
     def final_extraction(self, last_iteration: int) -> str:
-        r = self.res["final_extraction"]
-        partition = self.sched["cpu_partition"]
-        account = self.sched["account"]
-        log_dir = f"{self.proj}/logs"
         job_name = f"{self.name}_final_extraction"
+        header   = self._make_header("final_extraction", job_name, "cpu_partition")
 
-        dd_dir = self.env["dd_protocol_dir"]
-        proj_dir = self.proj
-        smiles_dir = self.lib["smiles_dir"]
-        ncpu = r["cpus"]
-
-        header = self.s.header(
-            job_name, self.wt["final_extraction"],
-            r["nodes"], r["cpus"], r["mem"], r["gpus"],
-            account, partition, log_dir
-        )
+        dd_dir   = self.cfg["env"]["dd_protocol_dir"]
+        smi_dir  = self.cfg["library"]["smiles_dir"]
+        ncpu     = self.cfg["scheduler"]["resources"]["final_extraction"]["cpus"]
 
         body = textwrap.dedent(f"""\
 
@@ -695,10 +626,10 @@ class JobScriptFactory:
             # This step maps those IDs back to SMILES so they can be prepared
             # for final explicit docking.
 
-            LAST_PRED="{proj_dir}/iteration_{last_iteration:02d}/morgan_1024_predictions"
+            LAST_PRED="{self.proj}/iteration_{last_iteration:02d}/morgan_1024_predictions"
 
             python "{dd_dir}/utilities/final_extraction.py" \\
-                -smile_dir "{smiles_dir}" \\
+                -smile_dir "{smi_dir}" \\
                 -prediction_dir "$LAST_PRED" \\
                 -processors {ncpu}
 
@@ -722,15 +653,16 @@ class DDOrchestrator:
     """
 
     def __init__(self, cfg: dict, dry_run: bool = False):
-        self.cfg = cfg
-        self.proj = cfg["project_dir"]
+        self.cfg        = cfg
+        self.proj       = cfg["project_dir"]
         self.total_iter = cfg["dd"]["total_iterations"]
-        sched_cfg = cfg["scheduler"]
-        self.scheduler = Scheduler(sched_cfg["type"], sched_cfg["account"], dry_run)
-        self.factory = JobScriptFactory(cfg, self.scheduler)
-        self.state = CampaignState(self.proj)
+        self.scheduler  = Scheduler(cfg["scheduler"]["type"],
+                                    cfg["scheduler"]["account"],
+                                    dry_run)
+        self.factory    = JobScriptFactory(cfg, self.scheduler)
+        self.state      = CampaignState(self.proj)
         self.scripts_dir = Path(self.proj) / "job_scripts"
-        self.log_dir = Path(self.proj) / "logs"
+        self.log_dir     = Path(self.proj) / "logs"
         self._ensure_dirs()
 
     def _ensure_dirs(self):
@@ -760,9 +692,6 @@ class DDOrchestrator:
         self.state.record_job(iteration, phase, job_id)
         return job_id
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
     def run(self, start_iter: int = 1, start_phase: int = 1):
         """
         Submit the full DD campaign.
@@ -776,47 +705,42 @@ class DDOrchestrator:
         print(f"  Project dir: {self.proj}")
         print(f"{'='*60}\n")
 
-        last_job_id = None  # job ID from previous phase / iteration
+        last_job_id = None
 
-        # If resuming mid-campaign, find the last known job ID
         if start_iter > 1 or start_phase > 1:
             last_job_id = self._find_resume_job_id(start_iter, start_phase)
             print(f"Resuming from iteration {start_iter}, phase {start_phase}")
             print(f"Chaining from job ID: {last_job_id}\n")
 
+        # FIX: PHASES is now a module-level constant, not rebuilt each call.
+        phase_methods = {
+            1: self.factory.phase1_sampling,
+            2: self.factory.phase2_ligand_prep,
+            3: self.factory.phase3_docking,
+            4: self.factory.phase4_training,
+            5: self.factory.phase5_inference,
+        }
+
         for iteration in range(start_iter, self.total_iter + 1):
             print(f"── Iteration {iteration} ─────────────────────────────")
-
             phase_start = start_phase if iteration == start_iter else 1
 
-            phases = {
-                1: self.factory.phase1_sampling,
-                2: self.factory.phase2_ligand_prep,
-                3: self.factory.phase3_docking,
-                4: self.factory.phase4_training,
-                5: self.factory.phase5_inference,
-            }
-
-            for phase_num, phase_fn in phases.items():
+            for phase_num, phase_fn in phase_methods.items():
                 if phase_num < phase_start:
-                    continue  # skip phases already done when resuming
+                    continue
 
-                label = {1: "Sampling", 2: "Ligand prep", 3: "Docking",
-                         4: "Training", 5: "Inference"}[phase_num]
-                print(f"  Phase {phase_num}: {label}")
-
+                print(f"  Phase {phase_num}: {PHASES[phase_num]}")
                 script = phase_fn(iteration)
                 last_job_id = self._submit_phase(
                     iteration, phase_num, script, last_job_id
                 )
-
             print()
 
         # Final extraction — depends on the last iteration's phase 5
         print("── Final extraction ─────────────────────────────────")
         final_script = self.factory.final_extraction(self.total_iter)
-        final_path = self._write_script("final_extraction", final_script)
-        final_id = self.scheduler.submit(final_path, last_job_id)
+        final_path   = self._write_script("final_extraction", final_script)
+        final_id     = self.scheduler.submit(final_path, last_job_id)
         self.state.data["final_extraction_job_id"] = final_id
         self.state.save()
 
@@ -828,18 +752,22 @@ class DDOrchestrator:
 
     def _find_resume_job_id(self, start_iter: int,
                             start_phase: int) -> str | None:
-        """Find the most recent completed job ID to chain the next phase from."""
-        # Walk backwards from (start_iter, start_phase - 1) to find a job ID
-        phase = start_phase - 1
-        iteration = start_iter
-        while iteration >= 1:
-            while phase >= 1:
-                jid = self.state.get_job_id(iteration, phase)
+        """
+        Walk backwards from (start_iter, start_phase - 1) through the state
+        log to find the most recent successfully submitted job ID.
+        That ID becomes the dependency for the first newly submitted phase.
+        """
+        # FIX: the original used a confusing nested while loop.
+        # A single flat iteration over (iteration, phase) pairs in reverse
+        # is easier to follow and does exactly the same thing.
+        for it in range(start_iter, 0, -1):
+            # For the start iteration, look only at phases before start_phase.
+            # For earlier iterations, all 5 phases are candidates.
+            phase_ceiling = (start_phase - 1) if it == start_iter else 5
+            for ph in range(phase_ceiling, 0, -1):
+                jid = self.state.get_job_id(it, ph)
                 if jid:
                     return jid
-                phase -= 1
-            iteration -= 1
-            phase = 5  # 5 phases per iteration
         return None
 
 
@@ -863,13 +791,13 @@ def main():
               python dd_orchestrator.py --config campaign.yaml --dry-run
         """)
     )
-    parser.add_argument("--config", required=True,
+    parser.add_argument("--config",      required=True,
                         help="Path to campaign YAML config file")
-    parser.add_argument("--start-iter", type=int, default=1,
+    parser.add_argument("--start-iter",  type=int, default=1,
                         help="Iteration to start from (default: 1)")
     parser.add_argument("--start-phase", type=int, default=1,
                         help="Phase within start-iter to start from (default: 1)")
-    parser.add_argument("--dry-run", action="store_true",
+    parser.add_argument("--dry-run",     action="store_true",
                         help="Write job scripts but do not submit them")
     args = parser.parse_args()
 

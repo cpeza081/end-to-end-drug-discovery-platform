@@ -1,0 +1,67 @@
+# =============================================================================
+# Deep Docking Active Learning Campaign Configuration
+# =============================================================================
+# All paths are absolute. Environment variables (e.g. $SCRATCH) are expanded.
+# Edit this file before launching a campaign. Every field is documented below.
+# =============================================================================
+
+# --- Campaign identity ------------------------------------------------------
+campaign_name: "my_target_dd"          # Used for directory names and job names
+project_dir: "$SCRATCH/dd_campaigns/my_target_dd"  # Root output directory
+
+# --- Library paths (produced by the library preparation pipeline) ------------
+library:
+  smiles_dir: "$SCRATCH/library_prepared"        # .txt files, one per chunk
+  fingerprint_dir: "$SCRATCH/library_prepared_fp" # Morgan FP files matching smiles_dir
+
+# --- Docking ----------------------------------------------------------------
+docking:
+  program: "FRED"           # "FRED" or "GLIDE" — controls ligand prep + docking commands
+  grid_file: "$SCRATCH/receptor/fred_grid.oeb"   # Docking grid (oeb for FRED, zip for GLIDE)
+  score_keyword: "FRED Chemgauss4 score"         # Field name in SDF output
+  # For GLIDE use: "r_i_docking_score"
+  glide_template: ""        # Only needed when program = GLIDE
+
+# --- Deep Docking parameters ------------------------------------------------
+dd:
+  total_iterations: 11      # How many AL iterations to run (paper recommends 4–11)
+  train_size: 1000000       # Molecules sampled for training per iteration
+  val_size: 1000000         # Molecules for validation AND test sets (set once in iter 1)
+  percent_first: 1.0        # % top-scorers = "virtual hit" in iteration 1 (e.g. 1.0 = top 1%)
+  percent_last: 0.01        # % top-scorers = "virtual hit" in the final iteration
+  recall: 0.90              # Fraction of true virtual hits the model must retrieve
+  num_models: 24            # Models trained per iteration (16/24/48/72/144)
+  num_cpus_sampling: 60     # Cores for sampling/fingerprint extraction steps
+
+# --- Cluster / scheduler ----------------------------------------------------
+scheduler:
+  type: "SLURM"             # "SLURM", "PBS", or "SGE"  (PBS/SGE = limited support)
+  account: "rrg-checco89"   # Billing account (SLURM: --account; PBS: -A)
+  cpu_partition: "cpu"      # Partition/queue for CPU jobs (sampling, OMEGA, FRED)
+  gpu_partition: "gpu"      # Partition/queue for GPU jobs (model training + inference)
+
+  # Walltime limits per phase — adjust based on your system and library size
+  walltime:
+    phase1_sampling: "00:30:00"
+    phase2_ligand_prep: "08:00:00"
+    phase3_docking: "24:00:00"
+    phase4_training: "20:00:00"
+    phase5_inference: "06:00:00"
+    final_extraction: "02:00:00"
+
+  # Resource requests per phase
+  resources:
+    phase1_sampling:  {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
+    phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G",  gpus: 0}
+    phase3_docking:   {nodes: 1, cpus: 60,  mem: "64G",  gpus: 0}
+    phase4_training:  {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
+    phase5_inference: {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
+    final_extraction: {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
+
+# --- Software environment ---------------------------------------------------
+env:
+  conda_env: "dd-env"       # Conda environment with rdkit, tensorflow, etc.
+  openeye_dir: "/project/6075065/software/software/2020/Core/openeye/03-2024/bin"
+  dd_protocol_dir: "$SCRATCH/DD_protocol"   # Cloned DD protocol repo
+  # OE_LICENSE is expected to be set in your cluster environment, or set here:
+  # oe_license: "/project/6075065/software/software/2020/Core/openeye/03-2024/oe_license.txt"
