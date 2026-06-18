@@ -4,15 +4,14 @@ dd_orchestrator.py
 ==================
 Deep Docking active-learning campaign orchestrator.
 
-Reads a YAML config file and drives the full DD loop:
+Reads a YAML config file and drives the DD loop:
   Iteration 1:  Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
   Iteration N:  Phase 1 (from previous predictions) → Phase 2 → 3 → 4 → 5
   Final:        extract SMILES of surviving virtual hits
 
 The orchestrator submits one job per phase, using the scheduler's native
-dependency mechanism so phases run in sequence without polling.  All job IDs
-are logged to <project_dir>/campaign_state.json so a crashed run can be
-resumed from the last completed phase.
+dependency mechanism.  All job IDs are logged to <project_dir>/campaign_state.json
+so a crashed run can be resumed from the last completed phase.
 
 Scheduler support
 -----------------
@@ -49,8 +48,7 @@ from dd_utils import load_config
 class CampaignState:
     """
     Tracks which phases have been submitted and stores their job IDs.
-    Written to <project_dir>/campaign_state.json after every submission,
-    so a crashed run can be resumed without re-submitting completed phases.
+    Written to <project_dir>/campaign_state.json after every submission.
     """
 
     def __init__(self, project_dir: str):
@@ -63,11 +61,13 @@ class CampaignState:
                 return json.load(f)
         return {"iterations": {}, "submitted_at": str(datetime.now())}
 
+    # We save the state after every job submission.
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w") as f:
             json.dump(self.data, f, indent=2)
 
+    # When we submit a job, we record its ID and timestamp as well as iteration and phase. 
     def record_job(self, iteration: int, phase: int, job_id: str):
         key = str(iteration)
         self.data["iterations"].setdefault(key, {})
@@ -75,11 +75,13 @@ class CampaignState:
         self.data["iterations"][key][f"phase{phase}_submitted"] = str(datetime.now())
         self.save()
 
+    # When resuming, we can look up the last submitted job ID for a given iteration and phase.
     def get_job_id(self, iteration: int, phase: int) -> str | None:
         return (self.data["iterations"]
                 .get(str(iteration), {})
                 .get(f"phase{phase}_job_id"))
 
+    # This allows us to check if a phase has already been submitted, so we don't resubmit it. 
     def is_phase_submitted(self, iteration: int, phase: int) -> bool:
         return self.get_job_id(iteration, phase) is not None
 
@@ -96,7 +98,7 @@ class Scheduler:
     """
 
     def __init__(self, stype: str, account: str, dry_run: bool = False):
-        self.stype = stype.upper()
+        self.stype = stype.upper() # Convert scheduler type to uppercase for consistency
         self.account = account
         self.dry_run = dry_run
         if self.stype not in ("SLURM", "PBS", "SGE"):
@@ -106,7 +108,7 @@ class Scheduler:
     def submit(self, script_path: str, depends_on: str | None = None) -> str:
         """Submit a script, optionally depending on a previous job ID.
         Returns the new job ID string."""
-        cmd = self._build_submit_cmd(script_path, depends_on)
+        cmd = self._build_submit_cmd(script_path, depends_on) # Build the appropriate submission command based on scheduler type. 
         print(f"  Submitting: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -114,20 +116,23 @@ class Scheduler:
             print(f"  [dry-run] Would submit → fake job ID: {fake_id}")
             return fake_id
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True) # Execute the submission command and capture the output, which contains the job ID assigned by the scheduler. 
         job_id = self._parse_job_id(result.stdout.strip())
         print(f"  → Job ID: {job_id}")
         return job_id
 
     def _build_submit_cmd(self, script: str, depends_on: str | None) -> list[str]:
-        # FIX: previously the SGE branch had no explicit return, relying on
-        # fall-through to a bare `return cmd` that didn't exist.  Each branch
-        # now returns explicitly, making the control flow unambiguous.
+        """Construct the appropriate submission command based on the scheduler type and dependency."""
+
+        # previously the SGE branch had no explicit return, relying on
+        # fall-through to a bare `return cmd` that didn't exist.
+
+        # Builds command used to submit a job script to the scheduler. 
         if self.stype == "SLURM":
-            cmd = ["sbatch"]
-            if depends_on:
-                cmd += [f"--dependency=afterok:{depends_on}"]
-            cmd.append(script)
+            cmd = ["sbatch"] # starts the command with the submit tool for SLURM.
+            if depends_on: # Checks whether this job should wait for another job first (i.e., if depends_on is not None).
+                cmd += [f"--dependency=afterok:{depends_on}"] # Adds a dependency option so this job only runs after the named job succeeds.
+            cmd.append(script) # Adds the script file path to the command. 
             return cmd
 
         if self.stype == "PBS":
@@ -145,7 +150,7 @@ class Scheduler:
         return cmd
 
     def _parse_job_id(self, stdout: str) -> str:
-        """Extract the numeric job ID from the scheduler's submission output."""
+        """Extract the job ID from the scheduler's submission output."""
         if self.stype == "SLURM":
             return stdout.split()[-1]       # "Submitted batch job 12345"
         if self.stype == "PBS":
@@ -157,8 +162,6 @@ class Scheduler:
                cpus: int, mem: str, gpus: int, account: str,
                partition: str, log_dir: str) -> str:
         """Return the scheduler-specific resource header for a job script."""
-        # FIX: gpu_line is omitted entirely (not just set to "") when gpus == 0,
-        # so the generated script header doesn't contain a stray blank line.
         gpu_lines = {
             "SLURM": f"#SBATCH --gres=gpu:{gpus}",
             "PBS":   f"#PBS -l ngpus={gpus}",
@@ -234,10 +237,10 @@ class JobScriptFactory:
         self.s = scheduler
 
         # FIX: previously the constructor unpacked config into short aliases
-        # (self.dd, self.env, …) AND every method re-bound those to local
-        # variables anyway, giving two levels of indirection with no benefit.
-        # Now we hold the full config and let each method reach into it directly
-        # with clear, self-documenting keys.  One level, no aliases.
+        # (self.dd, self.env, …) and every method re-bound those to local
+        # variables anyway, giving two levels of indirection.
+        # Now we hold the full config and let each method reach into it 
+        # with self-documenting keys.
         self.proj   = cfg["project_dir"]
         self.name   = cfg["campaign_name"]
 
