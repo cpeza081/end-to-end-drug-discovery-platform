@@ -5,8 +5,8 @@ dd_orchestrator.py
 Deep Docking active-learning campaign orchestrator.
 
 Reads a YAML config file and drives the DD loop:
-  Iteration 1:  Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5
-  Iteration N:  Phase 1 (from previous predictions) → Phase 2 → 3 → 4 → 5
+    Iteration 1:  Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5
+    Iteration N:  Phase 1 (from previous predictions) -> Phase 2 -> 3 -> 4 -> 5
   Final:        extract SMILES of surviving virtual hits
 
 The orchestrator submits one job per phase, using the scheduler's native
@@ -15,9 +15,9 @@ so a crashed run can be resumed from the last completed phase.
 
 Scheduler support
 -----------------
-SLURM  — full support (afterok dependencies, sbatch)
-PBS    — basic support (afterok dependencies, qsub)
-SGE    — basic support (hold_jid dependencies, qsub)
+SLURM  - full support (afterok dependencies, sbatch)
+PBS    - basic support (afterok dependencies, qsub)
+SGE    - basic support (hold_jid dependencies, qsub)
 
 Usage
 -----
@@ -93,7 +93,7 @@ class CampaignState:
 class Scheduler:
     """
     Thin wrapper around SLURM / PBS / SGE submission commands.
-    All scheduler-specific syntax is isolated here — the rest of the code
+    All scheduler-specific syntax is isolated here - the rest of the code
     is scheduler-agnostic.
     """
 
@@ -113,12 +113,12 @@ class Scheduler:
 
         if self.dry_run:
             fake_id = f"DRY_{Path(script_path).stem}"
-            print(f"  [dry-run] Would submit → fake job ID: {fake_id}")
+            print(f"  [dry-run] Would submit -> fake job ID: {fake_id}")
             return fake_id
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True) # Execute the submission command and capture the output, which contains the job ID assigned by the scheduler. 
         job_id = self._parse_job_id(result.stdout.strip())
-        print(f"  → Job ID: {job_id}")
+        print(f"  -> Job ID: {job_id}")
         return job_id
 
     def _build_submit_cmd(self, script: str, depends_on: str | None) -> list[str]:
@@ -237,7 +237,7 @@ class JobScriptFactory:
         self.s = scheduler
 
         # FIX: previously the constructor unpacked config into short aliases
-        # (self.dd, self.env, …) and every method re-bound those to local
+        # (self.dd, self.env, ...) and every method re-bound those to local
         # variables anyway, giving two levels of indirection.
         # Now we hold the full config and let each method reach into it 
         # with self-documenting keys.
@@ -254,7 +254,7 @@ class JobScriptFactory:
 
         return textwrap.dedent(f"""\
 
-            # ── Environment setup ──────────────────────────────────────────
+            # -- Environment setup -----------------------------------------
             export DD_PROJECT_DIR="{self.proj}"
             export DD_ITERATION={iteration}
             export DD_CAMPAIGN="{self.name}"
@@ -266,7 +266,7 @@ class JobScriptFactory:
             source "$(conda info --base)/etc/profile.d/conda.sh"
             conda activate "{conda_env}"
 
-            # Abort immediately if any command fails — this ensures the
+            # Abort immediately if any command fails - this ensures the
             # scheduler marks the job as FAILED rather than silently
             # continuing into a broken state, which would break the
             # dependency chain for subsequent phases.
@@ -302,8 +302,8 @@ class JobScriptFactory:
 
         # In iteration 1 we sample from the full fingerprint library.
         # In subsequent iterations we sample only from the previous iteration's
-        # virtual-hit predictions — validation and test sets are frozen after
-        # iteration 1 and reused throughout (see paper §'Molecular sample size').
+        # virtual-hit predictions - validation and test sets are frozen after
+        # iteration 1 and reused throughout (see paper Section 'Molecular sample size').
         if iteration == 1:
             data_dir     = fp_dir
             tot_sampling = train_sz + 2 * val_sz
@@ -313,7 +313,7 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Phase 1: Sampling (iteration {iteration}) ──────────────────
+            # -- Phase 1: Sampling (iteration {iteration}) ------------------
             # Determine how many molecules to sample from each library chunk,
             # then perform the actual random sampling, deduplicate, and extract
             # both Morgan fingerprints and SMILES for the sampled molecules.
@@ -361,7 +361,7 @@ class JobScriptFactory:
                 --smile_directory "{smi_dir}" \\
                 --tot_process {ncpu}
 
-            echo "[$(date)] Phase 1 complete — iteration {iteration}"
+            echo "[$(date)] Phase 1 complete - iteration {iteration}"
         """)
 
         return header + self._preamble(iteration) + body
@@ -376,8 +376,8 @@ class JobScriptFactory:
         ncpu     = self.cfg["scheduler"]["resources"]["phase2_ligand_prep"]["cpus"]
 
         # OMEGA command differs by docking program:
-        #   FRED  → pose mode, outputs .oeb.gz (receptor-filtered conformers)
-        #   GLIDE → classic mode, outputs .sdf  (one conformer per molecule)
+        #   FRED  -> pose mode, outputs .oeb.gz (receptor-filtered conformers)
+        #   GLIDE -> classic mode, outputs .sdf  (one conformer per molecule)
         if program == "FRED":
             omega_cmd = textwrap.dedent(f"""\
                 # Generate 3D conformers in OMEGA pose mode (for FRED docking)
@@ -409,7 +409,7 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Phase 2: Ligand preparation — OMEGA conformers (iteration {iteration}) ──
+            # -- Phase 2: Ligand preparation - OMEGA conformers (iteration {iteration}) --
             # OMEGA enumerates low-energy 3D conformations from the 2D SMILES.
             # These conformers are required as input to the docking program.
 
@@ -418,7 +418,7 @@ class JobScriptFactory:
 
         """) + omega_cmd + textwrap.dedent(f"""\
 
-            echo "[$(date)] Phase 2 complete — iteration {iteration}"
+            echo "[$(date)] Phase 2 complete - iteration {iteration}"
         """)
 
         return header + self._preamble(iteration) + body
@@ -469,7 +469,7 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Phase 3: Molecular docking (iteration {iteration}) ──────────
+            # -- Phase 3: Molecular docking (iteration {iteration}) ---------
             # Docks the sampled molecules (training + val + test in iter 1,
             # training augmentation only in later iterations).
             # Outputs one SDF file per input set inside the "docked" folder.
@@ -480,7 +480,7 @@ class JobScriptFactory:
 
         """) + docking_cmd + textwrap.dedent(f"""\
 
-            echo "[$(date)] Phase 3 complete — iteration {iteration}"
+            echo "[$(date)] Phase 3 complete - iteration {iteration}"
         """)
 
         return header + self._preamble(iteration) + body
@@ -503,7 +503,7 @@ class JobScriptFactory:
         recall     = self.cfg["dd"]["recall"]
 
         # is_last controls whether the final score threshold is applied.
-        # Python's bool → str gives "True"/"False" which the DD script expects.
+        # Python's bool -> str gives "True"/"False" which the DD script expects.
         is_last = str(iteration == total_iter)
 
         # Iteration 1 docks train + val + test (3 SDF files);
@@ -512,7 +512,7 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Phase 4: DNN model training (iteration {iteration}) ─────────
+            # -- Phase 4: DNN model training (iteration {iteration}) ---------
             # 4a: Extract binary labels (virtual hit / non-hit) from SDF scores.
             #     The score_keyword must match the SDF field name exactly.
             # 4b: Train {num_models} DNN models with different hyperparameters
@@ -523,7 +523,7 @@ class JobScriptFactory:
 
             ITER_DIR="{self.proj}/iteration_{iteration:02d}"
 
-            # Step 4a: convert SDF docking scores → binary label files
+            # Step 4a: convert SDF docking scores -> binary label files
             python "{dd_dir}/scripts_2/extract_labels.py" \\
                 --project_name "{self.name}" \\
                 --file_path "{self.proj}" \\
@@ -550,7 +550,7 @@ class JobScriptFactory:
                 bash "$SCRIPT"
             done
 
-            # Step 4d: grid search — select the best model by test-set precision
+            # Step 4d: grid search - select the best model by test-set precision
             python "{dd_dir}/scripts_2/hyperparameter_result_evaluation.py" \\
                 --n_iteration {iteration} \\
                 --data_path "{self.proj}/{self.name}" \\
@@ -558,7 +558,7 @@ class JobScriptFactory:
                 --number_mol {val_sz} \\
                 --recall {recall}
 
-            echo "[$(date)] Phase 4 complete — iteration {iteration}"
+            echo "[$(date)] Phase 4 complete - iteration {iteration}"
             echo "Best model stats:"
             cat "$ITER_DIR/best_model_stats.txt" 2>/dev/null || true
         """)
@@ -578,12 +578,12 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Phase 5: Library-wide inference (iteration {iteration}) ─────
+            # -- Phase 5: Library-wide inference (iteration {iteration}) -----
             # The best DNN model from Phase 4 scores every molecule in the
             # full fingerprint library.  Molecules whose predicted probability
             # of being a virtual hit falls below the recall-calibrated threshold
             # are discarded.  The surviving molecule IDs are written to
-            # morgan_1024_predictions/ — this becomes the sampling pool for
+            # morgan_1024_predictions/ - this becomes the sampling pool for
             # the next iteration's Phase 1.
 
             ITER_DIR="{self.proj}/iteration_{iteration:02d}"
@@ -602,7 +602,7 @@ class JobScriptFactory:
 
             # Step 5c: report the number of surviving virtual hits
             N_HITS=$(ls "$ITER_DIR/morgan_1024_predictions/" | wc -l)
-            echo "[$(date)] Phase 5 complete — iteration {iteration}"
+            echo "[$(date)] Phase 5 complete - iteration {iteration}"
             echo "Prediction files in morgan_1024_predictions: $N_HITS"
             echo "Estimated remaining molecules (from best_model_stats.txt):"
             grep "Total Left" "$ITER_DIR/best_model_stats.txt" 2>/dev/null || true
@@ -623,7 +623,7 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # ── Final extraction: retrieve SMILES for all surviving virtual hits ──
+            # -- Final extraction: retrieve SMILES for all surviving virtual hits --
             # After the last DD iteration, the morgan_1024_predictions folder
             # contains IDs of molecules the DNN predicts are top-scorers.
             # This step maps those IDs back to SMILES so they can be prepared
@@ -688,7 +688,7 @@ class DDOrchestrator:
         if self.state.is_phase_submitted(iteration, phase):
             existing = self.state.get_job_id(iteration, phase)
             print(f"  [skip] iter {iteration} phase {phase} already submitted "
-                  f"(job {existing}) — using existing ID for dependency chain")
+              f"(job {existing}) - using existing ID for dependency chain")
             return existing
 
         job_id = self.scheduler.submit(path, depends_on)
@@ -698,7 +698,7 @@ class DDOrchestrator:
     def run(self, start_iter: int = 1, start_phase: int = 1):
         """
         Submit the full DD campaign.
-        Each iteration submits phases 1–5 in a dependency chain.
+        Each iteration submits phases 1-5 in a dependency chain.
         The final extraction is submitted after the last iteration's phase 5.
         """
         print(f"\n{'='*60}")
@@ -725,7 +725,7 @@ class DDOrchestrator:
         }
 
         for iteration in range(start_iter, self.total_iter + 1):
-            print(f"── Iteration {iteration} ─────────────────────────────")
+            print(f"-- Iteration {iteration} ------------------------------")
             phase_start = start_phase if iteration == start_iter else 1
 
             for phase_num, phase_fn in phase_methods.items():
@@ -739,8 +739,8 @@ class DDOrchestrator:
                 )
             print()
 
-        # Final extraction — depends on the last iteration's phase 5
-        print("── Final extraction ─────────────────────────────────")
+        # Final extraction - depends on the last iteration's phase 5
+        print("-- Final extraction -------------------------------")
         final_script = self.factory.final_extraction(self.total_iter)
         final_path   = self._write_script("final_extraction", final_script)
         final_id     = self.scheduler.submit(final_path, last_job_id)
