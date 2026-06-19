@@ -16,7 +16,7 @@ library:
 
 # --- Docking ----------------------------------------------------------------
 docking:
-  program: "FRED"           # "FRED" or "GLIDE" — controls ligand prep + docking commands
+  program: "FRED"           # "FRED" or "GLIDE" controls ligand prep + docking commands
   grid_file: "$SCRATCH/receptor/fred_grid.oeb"   # Docking grid (oeb for FRED, zip for GLIDE)
   score_keyword: "FRED Chemgauss4 score"         # Field name in SDF output
   # For GLIDE use: "r_i_docking_score"
@@ -40,7 +40,7 @@ scheduler:
   cpu_partition: "cpu"      # Partition/queue for CPU jobs (sampling, OMEGA, FRED)
   gpu_partition: "gpu"      # Partition/queue for GPU jobs (model training + inference)
 
-  # Walltime limits per phase — adjust based on your system and library size
+  # Walltime limits per phase. Adjust this based on your system and library size
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"

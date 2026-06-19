@@ -24,12 +24,21 @@ from dd_orchestrator import PHASES as PHASE_NAMES  # single definition of phase 
 
 
 STATUS_SYMBOLS = {
-    "RUNNING":   "[RUN] ",
-    "PENDING":   "[WAIT]",
-    "COMPLETED": "[OK]  ",
-    "FAILED":    "[FAIL]",
-    "CANCELLED": "[CANC]",
-    "UNKNOWN":   "[??]  ",
+    "RUNNING":       "[RUN] ",
+    "PENDING":       "[WAIT]",
+    "COMPLETED":     "[OK]  ",
+    "FAILED":        "[FAIL]",
+    "CANCELLED":     "[CANC]",
+    "UNKNOWN":       "[??]  ",
+    "TIMEOUT":       "[TIME]",
+    "OUT_OF_MEMORY": "[OOM] ",
+    "NODE_FAIL":     "[NODE]",
+    "PREEMPTED":     "[PRE] ",
+    "REQUEUED":      "[REQ] ",
+    "SUSPENDED":     "[SUSP]",
+    "BOOT_FAIL":     "[BOOT]",
+    "DEADLINE":      "[DDL] ",
+    "REVOKED":       "[REV] ",
 }
 
 
@@ -162,7 +171,7 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
             else:
                 raw_status = "UNKNOWN"
 
-            symbol = STATUS_SYMBOLS.get(raw_status, "?")
+            symbol = STATUS_SYMBOLS.get(raw_status, "[??]  ")
             ts = submitted[:16] if submitted else ""
             print(f"    Phase {phase_num} ({phase_name:<12})  "
                   f"{symbol} {raw_status:<10}  job={job_id:<12}  {ts}")
