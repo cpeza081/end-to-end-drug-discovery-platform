@@ -200,7 +200,7 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
             status = query_job_status(final_id, sched_type)
         else:
             status = "UNKNOWN"
-        symbol = STATUS_SYMBOLS.get(status, "?")
+        symbol = STATUS_SYMBOLS.get(status, "[??]  ")
         print(f"  Final extraction:  {symbol} {status:<10}  job={final_id}")
     else:
         print(f"  Final extraction:  [not yet submitted]")
