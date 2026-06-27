@@ -3,7 +3,7 @@ dd_utils.py
 ===========
 Shared utilities for the DD orchestration scripts.
 
-Kept intentionally small such that only logic that is genuinely used by more than
+Kept intentionally small such that only logic that is used by more than
 one script lives here.  Everything domain-specific stays in its own file.
 """
 
