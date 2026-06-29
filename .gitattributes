@@ -1,0 +1,7 @@
+# Force Unix line endings for shell scripts regardless of OS
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
