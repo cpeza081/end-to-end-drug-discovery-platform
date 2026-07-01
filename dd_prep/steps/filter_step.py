@@ -33,31 +33,31 @@ Output (to ctx):    "filter_file"  - path to filtered SMILES library
 """
 
 from __future__ import annotations
-
+ 
 import logging
 from pathlib import Path
-
+ 
 import pandas as pd
-
+ 
 from dd_prep.steps.base import PipelineStep, PipelineContext
 from dd_prep.config import FilterConfig
-
+ 
 logger = logging.getLogger(__name__)
-
-
+ 
+ 
 class FilterStep(PipelineStep):
     name = "filter"
     description = "RDKit property-based pre-filter (sLogP, MW, FSP3, rings, ...)"
-
+ 
     # Chunk size for streaming reads.
     # Decrease if jobs are OOM-killed.
     STREAM_CHUNK_SIZE = 1_000_000
 
     def __init__(self, config: FilterConfig) -> None:
         super().__init__(config)
-
+ 
     # ---- Validation ----------------------------------------------------------
-
+ 
     def validate(self, ctx: PipelineContext) -> list[str]:
         """
         Two checks: RDKit availability (tested by import, not just pip list)
@@ -72,9 +72,9 @@ class FilterStep(PipelineStep):
         if not input_file or not Path(input_file).is_file():
             errors.append(f"Input file not found: '{input_file}'")
         return errors
-
+ 
     # ---- Execution -----------------------------------------------------------
-
+ 
     def run(self, ctx: PipelineContext) -> PipelineContext:
         # Imported here so validate() runs first; if RDKit is missing the
         # error is contextual rather than a bare ImportError at startup.
@@ -98,7 +98,7 @@ class FilterStep(PipelineStep):
             ctx.set("filter_file", out_file)
             ctx.set("n_molecules_filtered", n_filt)
             return ctx
-
+ 
         # ---- Detect file format from first line only -------------------------
         # Column detection runs on the first line so we never load the
         # full file into memory.
@@ -107,7 +107,7 @@ class FilterStep(PipelineStep):
             "  Detected format: sep=%r  smiles_col=%r  id_col=%r",
             sep, smiles_col, id_col,
         )
-
+ 
         # ---- Stream through file in fixed-size chunks ------------------------
         # Each chunk is loaded, filtered, and appended to the output file
         # before the next chunk is read.
@@ -115,10 +115,10 @@ class FilterStep(PipelineStep):
             "  Streaming %s in chunks of %d molecules ...",
             input_file, self.STREAM_CHUNK_SIZE,
         )
-
+ 
         n_raw = n_invalid = n_passed = 0
         header_written = False
-
+ 
         reader = pd.read_csv(
             input_file,
             sep=sep,
@@ -128,31 +128,33 @@ class FilterStep(PipelineStep):
             usecols=[smiles_col, id_col],  # skip extra columns (e.g. Enamine
                                             # catalog fields) at read time
         )
-
+ 
         with open(out_file, "w") as out_fh:
             for chunk_idx, chunk in enumerate(reader):
-
+ 
                 # Standardise column names
                 chunk.columns = [c.strip().lower() for c in chunk.columns]
                 chunk = chunk.rename(
                     columns={smiles_col: "smiles", id_col: "idnumber"}
                 ).fillna("").copy()
-
+ 
                 chunk_raw = len(chunk)
                 n_raw += chunk_raw
-
-                # Write header once at the top of the output file.
+ 
+                # Write header exactly once
                 if not header_written:
                     out_fh.write("smiles idnumber\n")
                     header_written = True
-
-                # Parse SMILES, invalid entries become None and are dropped.
+ 
+                # Parse SMILES -- invalid entries become None and are dropped.
+                # Checking before descriptor computation prevents RDKit from
+                # crashing on malformed SMILES deep in a slow calculation.
                 chunk["mol"] = chunk["smiles"].apply(
                     lambda s: Chem.MolFromSmiles(str(s)) if s else None
                 )
                 chunk = chunk[chunk["mol"].notna()].copy()
                 n_invalid += chunk_raw - len(chunk)
-
+ 
                 # Compute descriptors for this chunk
                 chunk["sLogP"]      = chunk["mol"].apply(Descriptors.MolLogP)
                 chunk["RotBonds"]   = chunk["mol"].apply(Descriptors.NumRotatableBonds)
@@ -162,8 +164,10 @@ class FilterStep(PipelineStep):
                 chunk["AliphRings"] = chunk["mol"].apply(rdMolDescriptors.CalcNumAliphaticRings)
                 chunk["TotRings"]   = chunk["AroRings"] + chunk["AliphRings"]
                 chunk["Charge"]     = chunk["mol"].apply(rdmolops.GetFormalCharge)
-
+ 
                 # Apply all filters in a single combined boolean mask.
+                # Subsetting the DataFrame once is faster than eight sequential
+                # _apply() calls (each of which creates a new DataFrame copy).
                 mask = (
                     chunk["sLogP"].between(cfg.slogp_min, cfg.slogp_max) &
                     (chunk["RotBonds"] <= cfg.rot_bonds_max) &
@@ -176,20 +180,21 @@ class FilterStep(PipelineStep):
                 )
                 passed = chunk[mask]
                 n_passed += len(passed)
-
-                # Append passing molecules to output
+ 
+                # Append passing molecules to output (no header repeat,
+                # no index column)
                 passed[["smiles", "idnumber"]].to_csv(
                     out_fh, sep=" ", index=False, header=False
                 )
-
+ 
                 # Progress log every 10 chunks (every 5M molecules at default
-                # chunk size)
+                # chunk size) so long runs aren't silent
                 if (chunk_idx + 1) % 10 == 0:
                     self.logger.info(
                         "  ... %d molecules processed, %d passed so far",
                         n_raw, n_passed,
                     )
-
+ 
         if n_invalid:
             self.logger.warning(
                 "  %d molecules had unparseable SMILES and were dropped.",
@@ -200,63 +205,69 @@ class FilterStep(PipelineStep):
             n_passed, n_raw, 100 * n_passed / max(n_raw, 1),
         )
         self.logger.info("  Written to %s", out_file)
-
+ 
         ctx.set("filter_file", out_file)
         ctx.set("n_molecules_filtered", n_passed)
         ctx.set("n_molecules_raw", n_raw)
         return ctx
-
+ 
     # ---- Helpers -------------------------------------------------------------
-
+ 
     @staticmethod
     def _detect_format(path: Path) -> tuple[str, str, str]:
         """
         Detect separator, SMILES column name, and ID column name by reading
         only the first line of the file.
-
+ 
         Returns (sep, smiles_col, id_col) using the lowercased header names
-        as they appear in the file, so they can be passed directly to pd.read_csv(usecols=...).
+        exactly as they appear in the file, so they can be passed directly
+        to pd.read_csv(usecols=...).
         """
         from rdkit import Chem
-
+ 
         with open(path) as fh:
             first_line = fh.readline().strip()
             second_line = fh.readline().strip()  # one data row for fallback
-
-        # Detect separator
+ 
+        # Detect separator.
+        # CRITICAL: must be a literal character, not a regex like r"\s+".
+        # When sep is a regex, pandas reads the entire file into memory before
+        # chunking, which defeats the purpose of chunksize entirely and causes
+        # OOM kills on large libraries.  We detect the character used
+        # and pass that literal string so pandas can stream efficiently.
         if "\t" in first_line:
             sep = "\t"
         elif "," in first_line:
             sep = ","
+        elif " " in first_line.strip():
+            sep = " "
         else:
-            sep = r"\s+"
-
-        # Split header into column names
+            sep = "\t"  # safe fallback -- better than a regex
+ 
+        # Split header into column names using any whitespace/delimiter
         import re
         cols = [c.strip().lower()
-                for c in re.split(r"\t|,|\s+" if sep == r"\s+" else sep,
-                                  first_line)]
-
+                for c in re.split(r"[\t, ]+", first_line)]
+ 
         smiles_names = {"smiles", "smi", "smile", "canonical_smiles"}
         id_names     = {"id", "idnumber", "name", "molecule_name",
                         "chembl_id", "zinc_id", "molid"}
-
+ 
         # Try to identify columns by name
         smiles_col = next((c for c in cols if c in smiles_names), None)
         id_col     = next((c for c in cols if c in id_names), None)
-
+ 
         if smiles_col and id_col:
             return sep, smiles_col, id_col
-
+ 
         # Fall back: try parsing the first data cell with RDKit
         if second_line:
-            data_cols = re.split(r"\t|,|\s+" if sep == r"\s+" else sep,
-                                 second_line)
+            data_cols = re.split(r"[\t, ]+", second_line)
             if len(data_cols) >= 2:
                 if Chem.MolFromSmiles(data_cols[0].strip()) is not None:
                     return sep, cols[0], cols[1]
                 else:
                     return sep, cols[1], cols[0]
-
+ 
         # Last resort: assume first two columns are smiles, id
         return sep, cols[0], cols[1]
