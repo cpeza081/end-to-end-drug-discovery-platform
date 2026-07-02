@@ -31,6 +31,7 @@ from pathlib import Path
 
 from dd_prep.config import TautomerConfig
 from dd_prep.steps.base import PipelineContext, PipelineStep
+from dd_prep.utils.file_utils import remove_if_output_ready
 from dd_prep.utils.parallel import run_parallel
 
 
@@ -59,6 +60,7 @@ class TautomerStep(PipelineStep):
         resume: bool = ctx.get("resume", True)
         n_parallel: int = ctx.get("n_parallel", 4)
         dry_run: bool = ctx.get("dry_run", False)
+        cleanup: bool = ctx.get("cleanup_intermediates", False)
 
         # Use isomer-expanded files if available; fall back to raw chunks.
         input_files: list[Path] = ctx.get("isom_files") or ctx.require("chunk_files")
@@ -77,6 +79,7 @@ class TautomerStep(PipelineStep):
 
         commands: list[list[str]] = []
         state_files: list[Path] = []
+        processed: list[tuple[Path, Path]] = []  # (input, output) pairs we run
 
         for in_file in input_files:
             # Strip any intermediate suffixes, then append _states.
@@ -101,12 +104,27 @@ class TautomerStep(PipelineStep):
             if cfg.extra_args:
                 cmd.extend(cfg.extra_args.split())
             commands.append(cmd)
+            processed.append((in_file, out))
 
         if commands:
             self.logger.info("Running TAUTOMERS on %d file(s) …", len(commands))
             run_parallel(commands, n_parallel, dry_run, desc="Tautomers")
         else:
             self.logger.info("All tautomer state files already present — skipping.")
+
+        # ── Optional cleanup ──────────────────────────────────────────────────
+        # Each _states.smi supersedes its input (an _isom.smi from flipper, or a
+        # raw chunk if flipper was disabled). Delete that input once the state
+        # file is confirmed complete. Skipped in dry-run.
+        if cleanup and not dry_run:
+            removed = sum(
+                remove_if_output_ready(in_file, out) for in_file, out in processed
+            )
+            if removed:
+                self.logger.info(
+                    "  cleanup_intermediates: removed %d upstream file(s) after tautomer step.",
+                    removed,
+                )
 
         ctx.set("state_files", state_files)
         return ctx

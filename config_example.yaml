@@ -38,6 +38,14 @@ resume: true
 # a configuration on a new cluster before submitting a real job.
 dry_run: false
 
+# Delete each stage's input once its output is safely written (filtered file
+# after split, chunks after flipper, _isom after tautomers).  Strongly
+# recommended for multi-TB libraries on quota-limited /project space, where
+# uncleaned intermediates can otherwise reach 5-10x the raw library size.
+# Trade-off: a stage whose input was deleted can't be re-run from scratch
+# (output-based resume still works).  Off by default.
+cleanup_intermediates: false
+
 
 # ── Stage 1: RDKit property filter (optional) ────────────────────────────────
 
@@ -71,6 +79,12 @@ filter:
 
   # Only keep neutral molecules (formal charge = 0).
   formal_charge: 0
+
+  # Worker processes for RDKit parsing / descriptor calculation.
+  # This is the main lever on filter run time — set it to the number of
+  # cores available to the job (match --cpus-per-task in 01_filter_split.sh).
+  # 1 = serial.
+  n_workers: 4
 
 
 # ── Stage 2: Split into chunks ───────────────────────────────────────────────
@@ -122,7 +136,17 @@ tautomer:
 
 organize:
   enabled: true
-  # No further options — this step is pure file renaming / copying.
+
+  # How each chunk is placed into library_prepared/:
+  #   "hardlink" (default) — create a hard link: no data copied, no extra disk,
+  #                          intermediate kept for resume. Falls back to a copy
+  #                          automatically if work_dir spans two filesystems.
+  #   "move"               — rename into place: no extra disk, intermediate gone.
+  #   "copy"               — physical copy (original behaviour): doubles this
+  #                          stage's disk usage.
+  # Prefer hardlink/move on large libraries — a full copy of every chunk is a
+  # major contributor to project-space usage.
+  mode: hardlink
 
 
 # ── Stage 6: RDKit Morgan fingerprints ───────────────────────────────────────

@@ -282,6 +282,11 @@ work_dir:   $WORK_DIR
 n_parallel: 4
 resume: true
 
+# Delete each stage's input once its output is written (filtered file, chunks,
+# _isom). Recommended for large libraries on quota-limited /project space.
+# A cleaned stage can't be re-run from scratch (output-based resume still works).
+cleanup_intermediates: false
+
 filter:
   enabled: true
   slogp_min: 1.0
@@ -296,6 +301,9 @@ filter:
   total_rings_min: 3
   total_rings_max: 4
   formal_charge: 0
+  # RDKit worker processes — the filter throughput lever.
+  # Match --cpus-per-task in slurm/01_filter_split.sh.
+  n_workers: 32
 
 split:
   chunk_size: 10000000
@@ -312,6 +320,8 @@ tautomer:
 
 organize:
   enabled: true
+  # hardlink (no extra disk, keeps intermediate) | move | copy
+  mode: hardlink
 
 fingerprint:
   enabled: true

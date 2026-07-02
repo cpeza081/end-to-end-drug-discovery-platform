@@ -1,9 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=dd_filter_split
-#SBATCH --time=04:00:00
+#SBATCH --time=24:00:00          # Filter is the throughput bottleneck. RDKit
+                                 # parse + descriptors runs at a few thousand
+                                 # mol/s PER CORE, so even parallelised across
+                                 # 32 cores a ~1B molecule library is many hours.
+                                 # Scale this with (library size / cores);
+                                 # 4h is far too short and the job will time out.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=32       # Filter now fans RDKit work across processes.
+                                 # Set filter.n_workers in the config to match.
 #SBATCH --mem=32G
 #SBATCH --output=logs/01_filter_split_%j.log
 #SBATCH --account=def-YOURPI
@@ -11,6 +17,11 @@
 # =============================================================================
 # Job 1: Filter and split the raw SMILES library.
 # Account and other settings are updated automatically by setup_cluster.sh
+#
+# Note: the filter step is now parallelised within the
+# step (filter.n_workers), but it is still CPU-bound — size --time and
+# --cpus-per-task to your library. For very large libraries consider raising
+# both, or pre-splitting the raw file and running filter as an array job.
 # =============================================================================
 
 set -euo pipefail

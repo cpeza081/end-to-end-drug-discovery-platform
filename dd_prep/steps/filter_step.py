@@ -33,25 +33,31 @@ Output (to ctx):    "filter_file"  - path to filtered SMILES library
 """
 
 from __future__ import annotations
- 
+
 import logging
+import multiprocessing as mp
 from pathlib import Path
- 
+
 import pandas as pd
- 
+
 from dd_prep.steps.base import PipelineStep, PipelineContext
 from dd_prep.config import FilterConfig
- 
+
 logger = logging.getLogger(__name__)
- 
- 
+
+
 class FilterStep(PipelineStep):
     name = "filter"
     description = "RDKit property-based pre-filter (sLogP, MW, FSP3, rings, ...)"
- 
-    # Chunk size for streaming reads.
+
+    # Chunk size for streaming reads (rows pulled from disk per pandas chunk).
     # Decrease if jobs are OOM-killed.
     STREAM_CHUNK_SIZE = 5_000_000
+
+    # Rows per unit of work handed to a worker process. Small enough to keep
+    # all workers busy and pickling cheap, large enough that per-task overhead
+    # (process dispatch, RDKit import already amortised) stays negligible.
+    WORKER_BATCH_SIZE = 20_000
 
     def __init__(self, config: FilterConfig) -> None:
         super().__init__(config)
@@ -76,13 +82,8 @@ class FilterStep(PipelineStep):
     # ---- Execution -----------------------------------------------------------
  
     def run(self, ctx: PipelineContext) -> PipelineContext:
-        # Imported here so validate() runs first; if RDKit is missing the
-        # error is contextual rather than a bare ImportError at startup.
-        from rdkit.Chem import Descriptors, rdMolDescriptors, rdmolops
-        from rdkit import Chem
-
         cfg: FilterConfig = self.config # type hint for convenience; self.config is actually just a dict, but we know from the pipeline setup that it has the structure of FilterConfig, so this lets us access config parameters with dot notation and get autocompletion in IDEs.
-        input_file = Path(ctx.require("input_file")) 
+        input_file = Path(ctx.require("input_file"))
         out_dir = self._mkdir(ctx.work_dir / "filtered") # each step gets its own subdirectory under the main work_dir, which is named after the step for clarity. The _mkdir helper creates it if it doesn't exist and returns the path.
         out_file = out_dir / "library_filtered.smi" 
 
@@ -109,16 +110,22 @@ class FilterStep(PipelineStep):
         )
  
         # ---- Stream through file in fixed-size chunks ------------------------
-        # Each chunk is loaded, filtered, and appended to the output file
-        # before the next chunk is read.
+        # Each pandas chunk is read from disk, then its rows are fanned out to a
+        # pool of worker processes that do the RDKit parsing, descriptor
+        # calculation, and threshold test. RDKit work is CPU-bound and
+        # single-threaded per molecule, so without this pool the whole step runs
+        # on one core regardless of --cpus-per-task, the dominant cost at
+        # billion-molecule scale. n_workers=1 keeps serial behaviour.
+        n_workers = max(1, int(getattr(cfg, "n_workers", 1)))
+        thresholds = _thresholds_from_config(cfg)
+
         self.logger.info(
-            "  Streaming %s in chunks of %d molecules ...",
-            input_file, self.STREAM_CHUNK_SIZE,
+            "  Streaming %s in chunks of %d molecules using %d worker(s) ...",
+            input_file, self.STREAM_CHUNK_SIZE, n_workers,
         )
- 
+
         n_raw = n_invalid = n_passed = 0
-        header_written = False
- 
+
         reader = pd.read_csv(
             input_file,
             sep=sep,
@@ -128,73 +135,60 @@ class FilterStep(PipelineStep):
             usecols=[smiles_col, id_col],  # skip extra columns (e.g. Enamine
                                             # catalog fields) at read time
         )
- 
-        with open(out_file, "w") as out_fh:
-            for chunk_idx, chunk in enumerate(reader):
- 
-                # Standardise column names
-                chunk.columns = [c.strip().lower() for c in chunk.columns]
-                chunk = chunk.rename(
-                    columns={smiles_col: "smiles", id_col: "idnumber"}
-                ).fillna("").copy()
- 
-                chunk_raw = len(chunk)
-                n_raw += chunk_raw
- 
-                # Write header exactly once
-                if not header_written:
-                    out_fh.write("smiles idnumber\n")
-                    header_written = True
- 
-                # Parse SMILES -- invalid entries become None and are dropped.
-                # Checking before descriptor computation prevents RDKit from
-                # crashing on malformed SMILES deep in a slow calculation.
-                chunk["mol"] = chunk["smiles"].apply(
-                    lambda s: Chem.MolFromSmiles(str(s)) if s else None
-                )
-                chunk = chunk[chunk["mol"].notna()].copy()
-                n_invalid += chunk_raw - len(chunk)
- 
-                # Compute descriptors for this chunk
-                chunk["sLogP"]      = chunk["mol"].apply(Descriptors.MolLogP)
-                chunk["RotBonds"]   = chunk["mol"].apply(Descriptors.NumRotatableBonds)
-                chunk["MW"]         = chunk["mol"].apply(Descriptors.ExactMolWt)
-                chunk["FSP3"]       = chunk["mol"].apply(rdMolDescriptors.CalcFractionCSP3)
-                chunk["AroRings"]   = chunk["mol"].apply(rdMolDescriptors.CalcNumAromaticRings)
-                chunk["AliphRings"] = chunk["mol"].apply(rdMolDescriptors.CalcNumAliphaticRings)
-                chunk["TotRings"]   = chunk["AroRings"] + chunk["AliphRings"]
-                chunk["Charge"]     = chunk["mol"].apply(rdmolops.GetFormalCharge)
- 
-                # Apply all filters in a single combined boolean mask.
-                # Subsetting the DataFrame once is faster than eight sequential
-                # _apply() calls (each of which creates a new DataFrame copy).
-                mask = (
-                    chunk["sLogP"].between(cfg.slogp_min, cfg.slogp_max) &
-                    (chunk["RotBonds"] <= cfg.rot_bonds_max) &
-                    chunk["MW"].between(cfg.mw_min, cfg.mw_max) &
-                    (chunk["FSP3"] >= cfg.fsp3_min) &
-                    chunk["AroRings"].between(cfg.aro_rings_min, cfg.aro_rings_max) &
-                    (chunk["AliphRings"] <= cfg.aliph_rings_max) &
-                    chunk["TotRings"].between(cfg.total_rings_min, cfg.total_rings_max) &
-                    (chunk["Charge"] == cfg.formal_charge)
-                )
-                passed = chunk[mask]
-                n_passed += len(passed)
- 
-                # Append passing molecules to output (no header repeat,
-                # no index column)
-                passed[["smiles", "idnumber"]].to_csv(
-                    out_fh, sep=" ", index=False, header=False
-                )
- 
-                # Progress log every 10 chunks (every 5M molecules at default
-                # chunk size) so long runs aren't silent
-                if (chunk_idx + 1) % 10 == 0:
-                    self.logger.info(
-                        "  ... %d molecules processed, %d passed so far",
-                        n_raw, n_passed,
-                    )
- 
+
+        # Use a 'spawn' pool (fork is unsafe with RDKit on some platforms).
+        pool = None
+        mapper = map  # serial default
+        if n_workers > 1:
+            ctx_mp = mp.get_context("spawn")
+            pool = ctx_mp.Pool(processes=n_workers)
+            # imap keeps memory bounded (results streamed instead of materialised) and
+            # preserves input order so output is deterministic.
+            mapper = lambda fn, it: pool.imap(fn, it)
+
+        try:
+            with open(out_file, "w") as out_fh:
+                out_fh.write("smiles idnumber\n")  # header, exactly once
+
+                for chunk_idx, chunk in enumerate(reader):
+                    # Standardise column names
+                    chunk.columns = [c.strip().lower() for c in chunk.columns]
+                    chunk = chunk.rename(
+                        columns={smiles_col: "smiles", id_col: "idnumber"}
+                    ).fillna("")
+
+                    n_raw += len(chunk)
+
+                    # Split this pandas chunk into small row batches and process
+                    # them across the worker pool. Each batch returns the passing
+                    # "smiles idnumber" lines plus (raw, invalid, passed) counts.
+                    rows = list(zip(chunk["smiles"].tolist(),
+                                    chunk["idnumber"].tolist()))
+                    batches = [
+                        (rows[i:i + self.WORKER_BATCH_SIZE], thresholds)
+                        for i in range(0, len(rows), self.WORKER_BATCH_SIZE)
+                    ]
+
+                    for lines, (b_raw, b_invalid, b_passed) in mapper(
+                        _filter_batch, batches
+                    ):
+                        if lines:
+                            out_fh.write("".join(lines))
+                        n_invalid += b_invalid
+                        n_passed += b_passed
+
+                    # Progress log every 10 chunks (every 5M molecules at default
+                    # chunk size) so long runs aren't silent
+                    if (chunk_idx + 1) % 10 == 0:
+                        self.logger.info(
+                            "  ... %d molecules processed, %d passed so far",
+                            n_raw, n_passed,
+                        )
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
         if n_invalid:
             self.logger.warning(
                 "  %d molecules had unparseable SMILES and were dropped.",
@@ -271,3 +265,98 @@ class FilterStep(PipelineStep):
  
         # Last resort: assume first two columns are smiles, id
         return sep, cols[0], cols[1]
+
+
+# ---- Parallel worker (module-level so it can be pickled by 'spawn') ----------
+
+def _thresholds_from_config(cfg: FilterConfig) -> dict:
+    """
+    Flatten the threshold fields of a FilterConfig into a plain dict.
+
+    Passed to each worker so children don't need to import the config module
+    or unpickle a dataclass. Just a small dict of floats/ints.
+    """
+    return {
+        "slogp_min":       cfg.slogp_min,
+        "slogp_max":       cfg.slogp_max,
+        "rot_bonds_max":   cfg.rot_bonds_max,
+        "mw_min":          cfg.mw_min,
+        "mw_max":          cfg.mw_max,
+        "fsp3_min":        cfg.fsp3_min,
+        "aro_rings_min":   cfg.aro_rings_min,
+        "aro_rings_max":   cfg.aro_rings_max,
+        "aliph_rings_max": cfg.aliph_rings_max,
+        "total_rings_min": cfg.total_rings_min,
+        "total_rings_max": cfg.total_rings_max,
+        "formal_charge":   cfg.formal_charge,
+    }
+
+
+def _filter_batch(
+    args: tuple[list[tuple[str, str]], dict]
+) -> tuple[list[str], tuple[int, int, int]]:
+    """
+    Filter one batch of ``(smiles, idnumber)`` rows.
+
+    Runs in a worker process. Imports RDKit locally so the parent never needs
+    it loaded. For each molecule it parses the SMILES, then applies the eight
+    physicochemical thresholds with short-circuit evaluation (cheapest checks
+    first, bail on the first failure). This is faster than computing every descriptor
+    for every molecule the way a full-DataFrame mask does.
+
+    Parameters
+    ----------
+    args : (rows, thresholds)
+        rows       : list of (smiles, idnumber) tuples
+        thresholds : dict from _thresholds_from_config
+
+    Returns
+    -------
+    (lines, (n_raw, n_invalid, n_passed))
+        lines : list of "smiles idnumber\\n" strings for molecules that passed
+        counts: batch-local totals for aggregation by the parent
+    """
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors, rdMolDescriptors, rdmolops
+
+    rows, th = args
+    lines: list[str] = []
+    n_invalid = 0
+
+    for smiles, idnumber in rows:
+        s = str(smiles) if smiles is not None else ""
+        if not s:
+            n_invalid += 1
+            continue
+
+        mol = Chem.MolFromSmiles(s)
+        if mol is None:
+            n_invalid += 1
+            continue
+
+        # Short-circuit threshold tests, cheapest / most-selective first.
+        slogp = Descriptors.MolLogP(mol)
+        if not (th["slogp_min"] <= slogp <= th["slogp_max"]):
+            continue
+        if Descriptors.NumRotatableBonds(mol) > th["rot_bonds_max"]:
+            continue
+        mw = Descriptors.ExactMolWt(mol)
+        if not (th["mw_min"] <= mw <= th["mw_max"]):
+            continue
+        if rdMolDescriptors.CalcFractionCSP3(mol) < th["fsp3_min"]:
+            continue
+        aro = rdMolDescriptors.CalcNumAromaticRings(mol)
+        if not (th["aro_rings_min"] <= aro <= th["aro_rings_max"]):
+            continue
+        aliph = rdMolDescriptors.CalcNumAliphaticRings(mol)
+        if aliph > th["aliph_rings_max"]:
+            continue
+        tot = aro + aliph
+        if not (th["total_rings_min"] <= tot <= th["total_rings_max"]):
+            continue
+        if rdmolops.GetFormalCharge(mol) != th["formal_charge"]:
+            continue
+
+        lines.append(f"{s} {idnumber}\n")
+
+    return lines, (len(rows), n_invalid, len(lines))
