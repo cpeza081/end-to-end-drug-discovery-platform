@@ -101,8 +101,8 @@ ask "Full path to your input SMILES library (.smi file):"
 read -r INPUT_FILE
 
 if [ -f "$INPUT_FILE" ]; then
-    N_MOLS=$(wc -l < "$INPUT_FILE")
-    success "Found library (~$N_MOLS lines)."
+    FILE_SIZE=$(du -sh "$INPUT_FILE" 2>/dev/null | cut -f1)
+    success "Found library $INPUT_FILE ($FILE_SIZE)."
 else
     warn "File not found: $INPUT_FILE"
     warn "You can update input_file in the config later."

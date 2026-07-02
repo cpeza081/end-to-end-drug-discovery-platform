@@ -51,7 +51,7 @@ class FilterStep(PipelineStep):
  
     # Chunk size for streaming reads.
     # Decrease if jobs are OOM-killed.
-    STREAM_CHUNK_SIZE = 1_000_000
+    STREAM_CHUNK_SIZE = 5_000_000
 
     def __init__(self, config: FilterConfig) -> None:
         super().__init__(config)
