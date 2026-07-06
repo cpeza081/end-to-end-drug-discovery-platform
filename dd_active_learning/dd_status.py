@@ -12,14 +12,15 @@ Usage:
   python dd_status.py --config campaign.yaml --no-scheduler   # offline mode
 """
 
+from __future__ import annotations
+
 import argparse
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
 
-from dd_utils import load_config
+from dd_utils import load_config, count_molecules_in_dir
 from dd_orchestrator import PHASES as PHASE_NAMES  # single definition of phase labels
 
 
@@ -60,9 +61,9 @@ def query_job_status(job_id: str, sched_type: str) -> str:
                 capture_output=True, text=True, timeout=10
             )
             for line in result.stdout.splitlines():
-                if "job_state" in line:
-                    state = line.split("=")[1].strip()
-                    # PBS uses single letters: R=Running, Q=Queued, C=Complete, E=Exiting
+                if "job_state" in line and "=" in line:
+                    state = line.split("=", 1)[1].strip()
+                    # R=Running, Q=Queued, C=Complete, E=Exiting
                     mapping = {"R": "RUNNING", "Q": "PENDING",
                                "C": "COMPLETED", "E": "RUNNING"}
                     return mapping.get(state, "UNKNOWN")
@@ -75,31 +76,25 @@ def query_job_status(job_id: str, sched_type: str) -> str:
             if "Following jobs do not exist" in result.stderr:
                 return "COMPLETED"  # SGE removes completed jobs from qstat
             for line in result.stdout.splitlines():
-                if "job_state" in line:
-                    state = line.split(":")[1].strip()
-                    return state.upper()
+                if "job_state" in line and ":" in line:
+                    state = line.split(":", 1)[1].strip()
+                    if state:
+                        return state.upper()
 
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, IndexError):
         pass
 
     return "UNKNOWN"
 
 
 def count_molecules(path: str) -> int | None:
-    """Count total molecules in a directory of prediction/fingerprint files."""
-    p = Path(path)
-    if not p.exists():
+    """Count total molecules in a directory of prediction/fingerprint files.
+
+    Delegates to the cached counter in dd_utils.
+    """
+    total = count_molecules_in_dir(path)
+    if total is None:
         return None
-    total = 0
-    for f in p.glob("*.txt"):
-        try:
-            # Each line is one molecule; subtract 1 for header if present
-            with open(f) as fh:
-                lines = sum(1 for _ in fh)
-            # DD prediction files have no header; FP files have a header line
-            total += max(0, lines)
-        except OSError:
-            pass
     return total if total > 0 else None
 
 

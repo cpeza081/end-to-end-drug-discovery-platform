@@ -73,8 +73,9 @@ if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
     # Filter
     FILTERED="$WORK_DIR/filtered/library_filtered.smi"
     if [ -f "$FILTERED" ]; then
-        N=$(( $(wc -l < "$FILTERED") - 1 ))
-        done_ "Filter          $N molecules"
+        # Report size (a stat, instant).
+        SIZE=$(du -h "$FILTERED" 2>/dev/null | cut -f1)
+        done_ "Filter          $SIZE on disk"
     else
         pending_ "Filter          not yet run"
     fi
@@ -113,8 +114,9 @@ if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
     if [ -d "$LIB_DIR" ]; then
         N_PREP=$(ls "$LIB_DIR"/*.txt 2>/dev/null | wc -l)
         if [ "$N_PREP" -gt 0 ]; then
-            TOTAL_MOLS=$(cat "$LIB_DIR"/*.txt 2>/dev/null | wc -l)
-            done_ "Organize        $N_PREP file(s), $TOTAL_MOLS molecules total"
+            # `du -sh` reads file sizes (metadata).
+            TOTAL_SIZE=$(du -sh "$LIB_DIR" 2>/dev/null | cut -f1)
+            done_ "Organize        $N_PREP file(s), $TOTAL_SIZE total"
         else
             pending_ "Organize        not yet run"
         fi

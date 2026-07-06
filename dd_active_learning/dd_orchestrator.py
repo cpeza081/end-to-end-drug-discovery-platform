@@ -31,8 +31,11 @@ Usage
   python dd_orchestrator.py --config campaign.yaml --dry-run
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import os
 import subprocess
 import textwrap
 from datetime import datetime
@@ -57,15 +60,34 @@ class CampaignState:
 
     def _load(self) -> dict:
         if self.path.exists():
-            with open(self.path) as f:
-                return json.load(f)
+            try:
+                with open(self.path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as exc:
+                # A truncated/corrupt state file (e.g. the process was killed
+                # mid-write) must not abort a resume.  Preserve the damaged
+                # file for inspection and start from a clean state.
+                backup = self.path.with_suffix(".json.corrupt")
+                try:
+                    self.path.replace(backup)
+                    print(f"  [warn] campaign state file was unreadable "
+                          f"({exc}); moved to {backup} and starting fresh.")
+                except OSError:
+                    print(f"  [warn] campaign state file was unreadable "
+                          f"({exc}); starting fresh.")
         return {"iterations": {}, "submitted_at": str(datetime.now())}
 
     # We save the state after every job submission.
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w") as f:
+        # Write to a temporary file in the same directory, then atomically
+        # rename over the real path.
+        tmp = self.path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
             json.dump(self.data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
 
     # When we submit a job, we record its ID and timestamp as well as iteration and phase. 
     def record_job(self, iteration: int, phase: int, job_id: str):
@@ -97,6 +119,11 @@ class Scheduler:
     is scheduler-agnostic.
     """
 
+    # Max seconds to wait for a submission command to return.  Submission is
+    # a quick scheduler RPC. If it hasn't answered by now something is wrong
+    # and we should fail loudly.
+    SUBMIT_TIMEOUT = 60
+
     def __init__(self, stype: str, account: str, dry_run: bool = False):
         self.stype = stype.upper() # Convert scheduler type to uppercase for consistency
         self.account = account
@@ -107,8 +134,12 @@ class Scheduler:
 
     def submit(self, script_path: str, depends_on: str | None = None) -> str:
         """Submit a script, optionally depending on a previous job ID.
-        Returns the new job ID string."""
-        cmd = self._build_submit_cmd(script_path, depends_on) # Build the appropriate submission command based on scheduler type. 
+        Returns the new job ID string.
+
+        Raises RuntimeError (with the scheduler's own stderr) on any
+        submission failure or timeout.
+        """
+        cmd = self._build_submit_cmd(script_path, depends_on) # Build the appropriate submission command based on scheduler type.
         print(f"  Submitting: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -116,16 +147,33 @@ class Scheduler:
             print(f"  [dry-run] Would submit -> fake job ID: {fake_id}")
             return fake_id
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True) # Execute the submission command and capture the output, which contains the job ID assigned by the scheduler. 
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True,
+                timeout=self.SUBMIT_TIMEOUT,
+            )  # Execute the submission command, stdout carries the new job ID.
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Scheduler command not found: {cmd[0]!r}. "
+                f"Is {self.stype} available on this host / PATH?"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Submission timed out after {self.SUBMIT_TIMEOUT}s: "
+                f"{' '.join(cmd)}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"Submission failed (exit {exc.returncode}) for "
+                f"{Path(script_path).name}:\n{(exc.stderr or '').strip()}"
+            ) from exc
+
         job_id = self._parse_job_id(result.stdout.strip())
         print(f"  -> Job ID: {job_id}")
         return job_id
 
     def _build_submit_cmd(self, script: str, depends_on: str | None) -> list[str]:
         """Construct the appropriate submission command based on the scheduler type and dependency."""
-
-        # previously the SGE branch had no explicit return, relying on
-        # fall-through to a bare `return cmd` that didn't exist.
 
         # Builds command used to submit a job script to the scheduler. 
         if self.stype == "SLURM":
@@ -150,13 +198,28 @@ class Scheduler:
         return cmd
 
     def _parse_job_id(self, stdout: str) -> str:
-        """Extract the job ID from the scheduler's submission output."""
-        if self.stype == "SLURM":
-            return stdout.split()[-1]       # "Submitted batch job 12345"
-        if self.stype == "PBS":
-            return stdout.split(".")[0]     # "12345.cluster.name"
-        # SGE: "Your job 12345 ("name") has been submitted"
-        return stdout.split()[2]
+        """Extract the job ID from the scheduler's submission output.
+
+        Raises RuntimeError if the output does not have the expected shape.
+        """
+        fields = stdout.split()
+        if not fields:
+            raise RuntimeError(
+                f"{self.stype} submission returned no output; cannot "
+                f"determine job ID."
+            )
+        try:
+            if self.stype == "SLURM":
+                return fields[-1]                # "Submitted batch job 12345"
+            if self.stype == "PBS":
+                return stdout.split(".")[0]      # "12345.cluster.name"
+            # SGE: 'Your job 12345 ("name") has been submitted'
+            return fields[2]
+        except IndexError as exc:
+            raise RuntimeError(
+                f"Could not parse job ID from {self.stype} output: "
+                f"{stdout!r}"
+            ) from exc
 
     def header(self, job_name: str, walltime: str, nodes: int,
                cpus: int, mem: str, gpus: int, account: str,
@@ -224,6 +287,25 @@ PHASES = {
     5: "Inference",
 }
 
+# Supported open-source docking engines.
+SUPPORTED_PROGRAMS = ("GNINA", "AUTODOCK_GPU")
+
+
+def _docking_program(cfg: dict) -> str:
+    """Return the normalised docking program, or raise with a clear message.
+
+    Accepts a couple of spelling variants for AutoDock-GPU for convenience.
+    """
+    raw = str(cfg["docking"]["program"]).upper().replace("-", "_")
+    if raw in ("AUTODOCKGPU", "AUTODOCK_GPU", "ADGPU"):
+        return "AUTODOCK_GPU"
+    if raw == "GNINA":
+        return "GNINA"
+    raise ValueError(
+        f"Unsupported docking program: {cfg['docking']['program']!r}. "
+        f"Choose one of: {', '.join(SUPPORTED_PROGRAMS)}."
+    )
+
 
 class JobScriptFactory:
     """
@@ -236,19 +318,18 @@ class JobScriptFactory:
         self.cfg = cfg
         self.s = scheduler
 
-        # FIX: previously the constructor unpacked config into short aliases
-        # (self.dd, self.env, ...) and every method re-bound those to local
-        # variables anyway, giving two levels of indirection.
-        # Now we hold the full config and let each method reach into it 
-        # with self-documenting keys.
+        # We store the project directory and campaign name for convenience.
         self.proj   = cfg["project_dir"]
         self.name   = cfg["campaign_name"]
+
+        # Directory holding this package's helper scripts (dd_ligand_prep.py,
+        # dd_autodock_export.py).
+        self.pkg_dir = Path(__file__).resolve().parent
 
     # ------------------------------------------------------------------
     # Shared preamble written at the top of every script
     # ------------------------------------------------------------------
     def _preamble(self, iteration: int) -> str:
-        oe_dir    = self.cfg["env"]["openeye_dir"]
         conda_env = self.cfg["env"]["conda_env"]
         dd_dir    = self.cfg["env"]["dd_protocol_dir"]
 
@@ -258,8 +339,6 @@ class JobScriptFactory:
             export DD_PROJECT_DIR="{self.proj}"
             export DD_ITERATION={iteration}
             export DD_CAMPAIGN="{self.name}"
-            export PATH="{oe_dir}:$PATH"
-            export OE_LICENSE="{oe_dir}/oe_license.txt"
             export DD_PROTOCOL_DIR="{dd_dir}"
 
             # Activate conda environment
@@ -271,6 +350,11 @@ class JobScriptFactory:
             # continuing into a broken state, which would break the
             # dependency chain for subsequent phases.
             set -euo pipefail
+
+            # nullglob: an unmatched glob expands to nothing, so `for f in dir/*.smi` 
+            # never feeds a bogus "dir/*.smi" path into a tool.  Loops that require 
+            # input guard against emptiness (below).
+            shopt -s nullglob
 
             echo "[$(date)] Starting iteration ${{DD_ITERATION}}"
         """)
@@ -367,56 +451,34 @@ class JobScriptFactory:
         return header + self._preamble(iteration) + body
 
     # ------------------------------------------------------------------
-    # Phase 2: 3D conformer generation with OMEGA
+    # Phase 2: 3D ligand preparation (RDKit ETKDG + Meeko)
     # ------------------------------------------------------------------
     def phase2_ligand_prep(self, iteration: int) -> str:
         job_name = f"{self.name}_i{iteration:02d}_p2_ligprep"
         header   = self._make_header("phase2_ligand_prep", job_name, "cpu_partition")
-        program  = self.cfg["docking"]["program"].upper()
+        program  = _docking_program(self.cfg)
         ncpu     = self.cfg["scheduler"]["resources"]["phase2_ligand_prep"]["cpus"]
 
-        # OMEGA command differs by docking program:
-        #   FRED  -> pose mode, outputs .oeb.gz (receptor-filtered conformers)
-        #   GLIDE -> classic mode, outputs .sdf  (one conformer per molecule)
-        if program == "FRED":
-            omega_cmd = textwrap.dedent(f"""\
-                # Generate 3D conformers in OMEGA pose mode (for FRED docking)
-                for SMI_FILE in "$ITER_DIR/smile/"*.smi; do
-                    BASE=$(basename "$SMI_FILE" .smi)
-                    oeomega pose \\
-                        -in  "$SMI_FILE" \\
-                        -out "$ITER_DIR/sdf/${{BASE}}.oeb.gz" \\
-                        -strictstereo false \\
-                        -mpi_np {ncpu}
-                done
-            """)
-        elif program == "GLIDE":
-            omega_cmd = textwrap.dedent(f"""\
-                # Generate 3D conformers in OMEGA classic mode (for GLIDE docking)
-                for SMI_FILE in "$ITER_DIR/smile/"*.smi; do
-                    BASE=$(basename "$SMI_FILE" .smi)
-                    oeomega classic \\
-                        -in  "$SMI_FILE" \\
-                        -out "$ITER_DIR/sdf/${{BASE}}.sdf" \\
-                        -maxconfs 1 \\
-                        -strictstereo false \\
-                        -mpi_np {ncpu}
-                done
-            """)
-        else:
-            raise ValueError(f"Unknown docking program: {program}. "
-                             f"Choose FRED or GLIDE.")
+        # Open-source 3D prep (RDKit ETKDG + optional Meeko), replacing OMEGA.
+        #   GNINA        -> 3D SDF per chunk        (Gnina docks multi-mol SDF)
+        #   AUTODOCK_GPU -> one PDBQT per molecule  (AutoDock-GPU docks 1/ligand)
+        out_format = "sdf" if program == "GNINA" else "pdbqt"
 
         body = textwrap.dedent(f"""\
 
-            # -- Phase 2: Ligand preparation - OMEGA conformers (iteration {iteration}) --
-            # OMEGA enumerates low-energy 3D conformations from the 2D SMILES.
-            # These conformers are required as input to the docking program.
+            # -- Phase 2: Ligand preparation (iteration {iteration}) --------
+            # RDKit embeds a 3D conformer for each sampled molecule and
+            # minimises it; Meeko converts to PDBQT when AutoDock-GPU is used.
+            # Output: $ITER_DIR/sdf/<chunk>.sdf   (Gnina)
+            #     or  $ITER_DIR/pdbqt/<chunk>/<molid>.pdbqt   (AutoDock-GPU)
 
             ITER_DIR="{self.proj}/iteration_{iteration:02d}"
-            mkdir -p "$ITER_DIR/sdf"
 
-        """) + omega_cmd + textwrap.dedent(f"""\
+            python "{self.pkg_dir}/dd_ligand_prep.py" \\
+                --smiles-dir "$ITER_DIR/smile" \\
+                --out-dir    "$ITER_DIR" \\
+                --format     {out_format} \\
+                --nprocs     {ncpu}
 
             echo "[$(date)] Phase 2 complete - iteration {iteration}"
         """)
@@ -428,44 +490,15 @@ class JobScriptFactory:
     # ------------------------------------------------------------------
     def phase3_docking(self, iteration: int) -> str:
         job_name = f"{self.name}_i{iteration:02d}_p3_docking"
-        header   = self._make_header("phase3_docking", job_name, "cpu_partition")
-        program  = self.cfg["docking"]["program"].upper()
-        grid     = self.cfg["docking"]["grid_file"]
-        ncpu     = self.cfg["scheduler"]["resources"]["phase3_docking"]["cpus"]
+        # Gnina and AutoDock-GPU are both GPU-accelerated -> gpu_partition.
+        header   = self._make_header("phase3_docking", job_name, "gpu_partition")
+        program  = _docking_program(self.cfg)
+        dock     = self.cfg["docking"]
 
-        if program == "FRED":
-            docking_cmd = textwrap.dedent(f"""\
-                # Dock each conformer file produced by Phase 2
-                for OEB_FILE in "$ITER_DIR/sdf/"*.oeb.gz; do
-                    BASE=$(basename "$OEB_FILE" .oeb.gz)
-                    fred \\
-                        -receptor "{grid}" \\
-                        -dbase "$OEB_FILE" \\
-                        -docked_molecule_file "$ITER_DIR/docked/${{BASE}}_docked.sdf" \\
-                        -hitlist_size 0 \\
-                        -mpi_np {ncpu}
-                done
-            """)
-        elif program == "GLIDE":
-            dd_dir      = self.cfg["env"]["dd_protocol_dir"]
-            glide_tmpl  = self.cfg["docking"].get("glide_template", "")
-            docking_cmd = textwrap.dedent(f"""\
-                # Generate GLIDE input scripts, then dock
-                python "{dd_dir}/scripts_1/input_glide.py" \\
-                    --project_name "{self.name}" \\
-                    --file_path "{self.proj}" \\
-                    --grid_file "{grid}" \\
-                    --iteration_no {iteration} \\
-                    --glide_input "{glide_tmpl}"
-
-                cd "$ITER_DIR/docked"
-                for GLIDE_IN in *.in; do
-                    "$SCHRODINGER/glide" -OVERWRITE -JOBNAME "${{GLIDE_IN%.in}}" "$GLIDE_IN"
-                done
-            """)
+        if program == "GNINA":
+            docking_cmd = self._gnina_docking_cmd(dock)
         else:
-            raise ValueError(f"Unknown docking program: {program}. "
-                             f"Choose FRED or GLIDE.")
+            docking_cmd = self._autodock_docking_cmd(dock)
 
         body = textwrap.dedent(f"""\
 
@@ -484,6 +517,86 @@ class JobScriptFactory:
         """)
 
         return header + self._preamble(iteration) + body
+
+    def _gnina_docking_cmd(self, dock: dict) -> str:
+        """Gnina docking: one multi-molecule SDF per chunk, into the explicit
+        box derived once by dd_receptor_prep.py (receptor_box.json).  Gnina uses
+        the GPU for CNN pose scoring.  The box is then read at runtime."""
+        receptor = dock["receptor_file"]
+        box_json = dock["box_json"]
+        cnn      = dock.get("gnina_cnn", "rescore")
+        exhaust  = dock.get("exhaustiveness", 8)
+        return textwrap.dedent(f"""\
+            # Read the pre-computed binding box (center/size) once.
+            BOX=$(python -c "import json; d=json.load(open('{box_json}')); \\
+c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
+            read CX CY CZ SX SY SZ <<< "$BOX"
+
+            # Dock each prepared SDF chunk with Gnina into that box.
+            SDF_FILES=("$ITER_DIR/sdf/"*.sdf)
+            if [ ${{#SDF_FILES[@]}} -eq 0 ]; then
+                echo "ERROR: no .sdf files in $ITER_DIR/sdf/ - Phase 2 output missing" >&2
+                exit 1
+            fi
+            for SDF_FILE in "${{SDF_FILES[@]}}"; do
+                BASE=$(basename "$SDF_FILE" .sdf)
+                gnina \\
+                    --receptor "{receptor}" \\
+                    --ligand "$SDF_FILE" \\
+                    --center_x "$CX" --center_y "$CY" --center_z "$CZ" \\
+                    --size_x "$SX" --size_y "$SY" --size_z "$SZ" \\
+                    --cnn_scoring {cnn} \\
+                    --exhaustiveness {exhaust} \\
+                    --seed 0 \\
+                    --out "$ITER_DIR/docked/${{BASE}}_docked.sdf"
+            done
+        """)
+
+    def _autodock_docking_cmd(self, dock: dict) -> str:
+        """AutoDock-GPU docking: batch each chunk's per-molecule PDBQTs against
+        the pre-computed grid maps, then export each chunk's .dlg results into a
+        single scored SDF for Phase 4."""
+        maps_fld = dock["maps_fld"]
+        adbin    = dock.get("autodock_bin", "autodock_gpu_128wi")
+        nrun     = dock.get("autodock_nrun", 10)
+        return textwrap.dedent(f"""\
+            # Dock each chunk's per-molecule PDBQTs with AutoDock-GPU (batch mode),
+            # then convert the .dlg results to a scored SDF for label extraction.
+            CHUNK_DIRS=("$ITER_DIR/pdbqt/"*/)
+            if [ ${{#CHUNK_DIRS[@]}} -eq 0 ]; then
+                echo "ERROR: no per-chunk pdbqt dirs in $ITER_DIR/pdbqt/ - Phase 2 output missing" >&2
+                exit 1
+            fi
+            for CHUNK_DIR in "${{CHUNK_DIRS[@]}}"; do
+                CHUNK=$(basename "$CHUNK_DIR")
+                mkdir -p "$ITER_DIR/docked/$CHUNK"
+
+                # Build the AutoDock-GPU batch file: shared maps on line 1, then
+                # (ligand pdbqt, result basename) pairs for every molecule.
+                # A chunk can hold ~1M ligands, so stream with find (no giant
+                # bash array) and use parameter expansion (no per-file forks),
+                # writing the batch file in a single open.
+                BATCH="$ITER_DIR/docked/$CHUNK.filelist"
+                {{
+                    echo "{maps_fld}"
+                    find "$CHUNK_DIR" -maxdepth 1 -name '*.pdbqt' | while IFS= read -r LIG; do
+                        LIGBASE="${{LIG##*/}}"; LIGBASE="${{LIGBASE%.pdbqt}}"
+                        printf '%s\\n%s\\n' "$LIG" "$ITER_DIR/docked/$CHUNK/$LIGBASE"
+                    done
+                }} > "$BATCH"
+                if [ "$(wc -l < "$BATCH")" -le 1 ]; then
+                    echo "WARNING: no pdbqt ligands in $CHUNK_DIR - skipping" >&2
+                    continue
+                fi
+
+                {adbin} --filelist "$BATCH" --nrun {nrun}
+
+                # Collapse this chunk's .dlg results into one scored SDF.
+                python "{self.pkg_dir}/dd_autodock_export.py" \\
+                    --dlg-dir "$ITER_DIR/docked/$CHUNK" \\
+                    --out-sdf "$ITER_DIR/docked/${{CHUNK}}_docked.sdf"
+            done
+        """)
 
     # ------------------------------------------------------------------
     # Phase 4: DNN model training
@@ -546,7 +659,12 @@ class JobScriptFactory:
 
             # Step 4c: run all model training scripts sequentially
             # (GPU resource is shared across them within this job allocation)
-            for SCRIPT in "$ITER_DIR/simple_job/"*.sh; do
+            TRAIN_SCRIPTS=("$ITER_DIR/simple_job/"*.sh)
+            if [ ${{#TRAIN_SCRIPTS[@]}} -eq 0 ]; then
+                echo "ERROR: no training scripts in $ITER_DIR/simple_job/ - simple_job_models_manual.py produced nothing" >&2
+                exit 1
+            fi
+            for SCRIPT in "${{TRAIN_SCRIPTS[@]}}"; do
                 bash "$SCRIPT"
             done
 
@@ -596,7 +714,12 @@ class JobScriptFactory:
                 --morgan_directory "{fp_dir}"
 
             # Step 5b: run inference on every chunk
-            for SCRIPT in "$ITER_DIR/simple_job_predictions/"*.sh; do
+            PRED_SCRIPTS=("$ITER_DIR/simple_job_predictions/"*.sh)
+            if [ ${{#PRED_SCRIPTS[@]}} -eq 0 ]; then
+                echo "ERROR: no inference scripts in $ITER_DIR/simple_job_predictions/ - simple_job_predictions_manual.py produced nothing" >&2
+                exit 1
+            fi
+            for SCRIPT in "${{PRED_SCRIPTS[@]}}"; do
                 bash "$SCRIPT"
             done
 

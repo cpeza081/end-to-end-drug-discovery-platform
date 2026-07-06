@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from dd_utils import load_config
+from dd_orchestrator import _docking_program
 
 
 class Validator:
@@ -62,12 +63,61 @@ class Validator:
                 n = sum(1 for _ in p.iterdir())
                 self.ok(f"{label}: {path}  ({n} files)")
 
-        # Grid file must exist
-        grid = dock["grid_file"]
-        if Path(grid).exists():
-            self.ok(f"Docking grid: {grid}")
+        # Docking engine + receptor / binding-site inputs
+        try:
+            program = _docking_program(self.cfg)
+            self.ok(f"Docking program: {program}")
+        except ValueError as exc:
+            self.fail(str(exc))
+            program = None
+
+        receptor = dock.get("receptor_file")
+        if receptor and Path(receptor).exists():
+            self.ok(f"Receptor: {receptor}")
         else:
-            self.fail(f"Docking grid not found: {grid}")
+            self.fail(f"Receptor file not found: {receptor}")
+
+        # The binding box is produced once by dd_receptor_prep.py.
+        box_json = dock.get("box_json")
+        if box_json and Path(box_json).exists():
+            self.ok(f"Binding box: {box_json}")
+        else:
+            self.fail(f"Binding box not found: {box_json} "
+                      f"(run: python dd_receptor_prep.py --config <campaign.yaml>)")
+
+        # Site strategy inputs (checked for the configured method only).
+        site = dock.get("site", {})
+        method = site.get("method", "reference_ligand")
+        if method == "reference_ligand":
+            ref = site.get("reference_ligand")
+            if ref and Path(ref).exists():
+                self.ok(f"Reference ligand: {ref}")
+            else:
+                self.fail(f"site.method=reference_ligand but reference ligand "
+                          f"not found: {ref}")
+        elif method == "p2rank":
+            self.ok("Site strategy: p2rank (pocket predicted from receptor)")
+        elif method == "manual":
+            center, size = site.get("center"), site.get("size")
+            ok_shape = (isinstance(center, (list, tuple)) and len(center) == 3
+                        and isinstance(size, (list, tuple)) and len(size) == 3)
+            if ok_shape and all(s > 0 for s in size):
+                self.ok(f"Site strategy: manual (center={center}, size={size})")
+            else:
+                self.fail("site.method=manual requires center [x,y,z] and "
+                          "size [x,y,z] (three positive numbers each)")
+        else:
+            self.warn(f"Unknown site.method '{method}' - dd_receptor_prep.py "
+                      f"will reject it unless a matching strategy is registered")
+
+        # AutoDock-GPU needs pre-computed grid maps.
+        if program == "AUTODOCK_GPU":
+            maps = dock.get("maps_fld")
+            if maps and Path(maps).exists():
+                self.ok(f"AutoDock-GPU maps: {maps}")
+            else:
+                self.fail(f"AutoDock-GPU maps (.fld) not found: {maps} "
+                          f"(run dd_receptor_prep.py to build them)")
 
         # DD protocol repo
         dd = env["dd_protocol_dir"]
@@ -92,34 +142,35 @@ class Validator:
         if dd_ok:
             self.ok(f"DD protocol dir: {dd}  (all scripts found)")
 
-        # OpenEye dir
-        oe = env["openeye_dir"]
-        if Path(oe).exists():
-            self.ok(f"OpenEye dir: {oe}")
-        else:
-            self.fail(f"OpenEye dir not found: {oe}")
-
     # ------------------------------------------------------------------
     def check_tools(self):
         print("\n-- Tools -------------------------------------------")
-        oe = self.cfg["env"]["openeye_dir"]
-        program = self.cfg["docking"]["program"].upper()
+        try:
+            program = _docking_program(self.cfg)
+        except ValueError:
+            program = None
 
-        # OpenEye tools
-        oe_tools = ["flipper", "tautomers", "oeomega"]
-        if program == "FRED":
-            oe_tools.append("fred")
+        # Docking-engine binaries (must be on PATH inside the conda env).
+        dock = self.cfg["docking"]
+        if program == "GNINA":
+            docking_tools = ["gnina"]
+        elif program == "AUTODOCK_GPU":
+            # The docking binary plus the receptor-prep toolchain.
+            docking_tools = [dock.get("autodock_bin", "autodock_gpu_128wi"),
+                             "autogrid4", "mk_prepare_receptor.py"]
+        else:
+            docking_tools = []
 
-        for tool in oe_tools:
-            full = Path(oe) / tool
-            if full.exists():
-                self.ok(f"OpenEye tool found: {tool}")
+        # P2Rank is only needed when that site strategy is selected.
+        if dock.get("site", {}).get("method") == "p2rank":
+            docking_tools.append(dock["site"].get("p2rank_exec", "prank"))
+
+        for tool in docking_tools:
+            if shutil.which(tool):
+                self.ok(f"Tool on PATH: {tool}")
             else:
-                # Also check $PATH
-                if shutil.which(tool):
-                    self.ok(f"OpenEye tool on PATH: {tool}")
-                else:
-                    self.fail(f"OpenEye tool not found: {tool}")
+                self.warn(f"Tool not found on PATH: {tool} "
+                          f"(must be available on the compute node at run time)")
 
         # Scheduler command
         sched = self.cfg["scheduler"]["type"].upper()
@@ -130,8 +181,8 @@ class Validator:
             self.warn(f"Scheduler command not found on PATH: {submit_cmd} "
                       f"(OK if running from a login node)")
 
-        # Python packages
-        packages = ["yaml", "pandas", "rdkit"]
+        # Python packages (open-source ligand-prep + docking-export stack).
+        packages = ["yaml", "pandas", "numpy", "rdkit", "meeko"]
         for pkg in packages:
             try:
                 __import__(pkg)
@@ -142,19 +193,6 @@ class Validator:
     # ------------------------------------------------------------------
     def check_environment(self):
         print("\n-- Environment -------------------------------------")
-
-        # OE_LICENSE
-        oe_lic = os.environ.get("OE_LICENSE", "")
-        oe_dir = self.cfg["env"]["openeye_dir"]
-        local_lic = Path(oe_dir) / "oe_license.txt"
-
-        if oe_lic and Path(oe_lic).exists():
-            self.ok(f"OE_LICENSE (env var): {oe_lic}")
-        elif local_lic.exists():
-            self.ok(f"OE_LICENSE (local): {local_lic}")
-        else:
-            self.fail("OpenEye license not found (OE_LICENSE env var or "
-                      "<openeye_dir>/oe_license.txt)")
 
         # Conda env
         conda_env = self.cfg["env"]["conda_env"]

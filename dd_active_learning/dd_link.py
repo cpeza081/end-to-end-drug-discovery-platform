@@ -39,7 +39,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dd_utils import load_config
+from dd_utils import load_config, count_molecules_in_dir
 
 try:
     import yaml
@@ -66,6 +66,7 @@ class PrepRunStatus:
         self.checkpoint_path = self.work_dir / ".checkpoint.json"
 
     def checkpoint(self) -> dict:
+        # This reads the saved progress file so the script can tell what has already finished.
         if not self.checkpoint_path.is_file():
             return {}
         with open(self.checkpoint_path) as f:
@@ -96,17 +97,11 @@ class PrepRunStatus:
         return (len(problems) == 0, problems)
 
     def molecule_count(self) -> int | None:
-        """Count molecules across all prepared SMILES chunks, for a sanity-check summary."""
-        if not self.smiles_dir.is_dir():
-            return None
-        total = 0
-        for f in self.smiles_dir.glob("*.txt"):
-            try:
-                with open(f) as fh:
-                    total += sum(1 for _ in fh)
-            except OSError:
-                pass
-        return total
+        """Count molecules across all prepared SMILES chunks for a sanity-check.
+
+        Uses the cached, buffered counter in dd_utils.
+        """
+        return count_molecules_in_dir(self.smiles_dir)
 
 
 # =============================================================================
@@ -204,6 +199,7 @@ def _trailing_comment(line: str) -> str:
 # =============================================================================
 
 def main():
+    # This is the command line entry point for linking or checking a preparation run.
     parser = argparse.ArgumentParser(
         description="Link a dd_prep run to a dd_active_learning campaign",
         formatter_class=argparse.RawDescriptionHelpFormatter,
