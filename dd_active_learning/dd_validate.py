@@ -165,12 +165,21 @@ class Validator:
         if dock.get("site", {}).get("method") == "p2rank":
             docking_tools.append(dock["site"].get("p2rank_exec", "prank"))
 
+        # If the docking tools are provided by cluster modules, they will not
+        # be on PATH here (login node), that's expected. 
+        modules = self.cfg["env"].get("modules") or []
         for tool in docking_tools:
             if shutil.which(tool):
                 self.ok(f"Tool on PATH: {tool}")
+            elif modules:
+                self.warn(f"{tool} not on PATH now (expected if it comes from a "
+                          f"module: {', '.join(modules)}); jobs will module-load it")
             else:
                 self.warn(f"Tool not found on PATH: {tool} "
                           f"(must be available on the compute node at run time)")
+
+        if modules:
+            self.ok(f"Cluster modules to load in jobs: {', '.join(modules)}")
 
         # Scheduler command
         sched = self.cfg["scheduler"]["type"].upper()

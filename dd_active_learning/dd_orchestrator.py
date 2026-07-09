@@ -333,7 +333,20 @@ class JobScriptFactory:
         conda_env = self.cfg["env"]["conda_env"]
         dd_dir    = self.cfg["env"]["dd_protocol_dir"]
 
-        return textwrap.dedent(f"""\
+        # Cluster modules that provide the docking engine (gnina / AutoDock-GPU /
+        # autogrid4, ...).  These are `module load`ed inside every job.  Guarded with `type module` so
+        # the script still runs on systems without an environment-module system.
+        modules = self.cfg["env"].get("modules") or []
+        module_block = ""
+        if modules:
+            module_block = (
+                "# Load cluster modules that provide the docking tools.\n"
+                "if type module &>/dev/null; then\n"
+                f"    module load {' '.join(modules)}\n"
+                "fi\n"
+            )
+
+        preamble = textwrap.dedent(f"""\
 
             # -- Environment setup -----------------------------------------
             export DD_PROJECT_DIR="{self.proj}"
@@ -345,6 +358,7 @@ class JobScriptFactory:
             source "$(conda info --base)/etc/profile.d/conda.sh"
             conda activate "{conda_env}"
 
+            __DD_MODULES__
             # Abort immediately if any command fails - this ensures the
             # scheduler marks the job as FAILED rather than silently
             # continuing into a broken state, which would break the
@@ -358,6 +372,7 @@ class JobScriptFactory:
 
             echo "[$(date)] Starting iteration ${{DD_ITERATION}}"
         """)
+        return preamble.replace("__DD_MODULES__\n", module_block)
 
     def _make_header(self, phase_key: str, job_name: str,
                      partition_key: str) -> str:

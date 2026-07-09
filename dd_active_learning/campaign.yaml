@@ -96,8 +96,11 @@ scheduler:
 
 # --- Software environment ---------------------------------------------------
 env:
-  # Conda env must provide: rdkit, meeko, tensorflow, pandas, numpy, and the
-  # chosen docking engine (gnina or autodock-gpu) + autogrid4 on PATH.
-  # OpenEye is NOT used by the docking loop anymore.
+  # Conda env must provide: rdkit, meeko, tensorflow, pandas, numpy.
   conda_env: "dd-env"
   dd_protocol_dir: "$SCRATCH/DD_protocol"   # Cloned DD protocol repo
+
+  # Cluster modules `module load`ed inside every job so the docking tools
+  # (gnina / autodock_gpu / autogrid4, and optionally P2Rank) are on PATH on
+  # the compute node.  Leave as [] if they are already on PATH.
+  modules: ["gnina"]        # e.g. ["gnina"]  or  ["autodock-gpu", "autodock"]
