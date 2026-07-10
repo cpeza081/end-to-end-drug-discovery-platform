@@ -203,18 +203,37 @@ class Validator:
     def check_environment(self):
         print("\n-- Environment -------------------------------------")
 
-        # Conda env
-        conda_env = self.cfg["env"]["conda_env"]
-        try:
-            result = subprocess.run(
-                ["conda", "env", "list"], capture_output=True, text=True, timeout=15
-            )
-            if conda_env in result.stdout:
-                self.ok(f"Conda environment found: {conda_env}")
+        # Python environment: either a conda env or a virtualenv, depending on
+        # how env.activate was set up by the wizard.
+        env_cfg = self.cfg["env"]
+        activate = env_cfg.get("activate", "") or ""
+        conda_env = env_cfg.get("conda_env", "") or ""
+
+        if "bin/activate" in activate:
+            # virtualenv: find the activate script path in the command
+            venv_path = next((t for t in activate.replace('"', " ").split()
+                              if t.endswith("bin/activate")), None)
+            if venv_path and Path(venv_path).exists():
+                self.ok(f"Python virtualenv found: {venv_path}")
+            elif venv_path:
+                self.warn(f"virtualenv not created yet: {venv_path} "
+                          f"(re-run setup_active_learning.sh to build it)")
             else:
-                self.fail(f"Conda environment not found: {conda_env}")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            self.warn("Cannot verify conda environment (conda not on PATH or timeout)")
+                self.ok("Using a Python virtualenv (env.activate set)")
+        elif conda_env:
+            try:
+                result = subprocess.run(
+                    ["conda", "env", "list"], capture_output=True, text=True, timeout=15
+                )
+                if conda_env in result.stdout:
+                    self.ok(f"Conda environment found: {conda_env}")
+                else:
+                    self.fail(f"Conda environment not found: {conda_env}")
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                self.warn("Cannot verify conda environment (conda not on PATH or timeout)")
+        else:
+            self.warn("No env.activate or env.conda_env set; how will jobs load "
+                      "the Python environment?")
 
         # SCRATCH / project dir parent writeable
         proj = Path(self.cfg["project_dir"])

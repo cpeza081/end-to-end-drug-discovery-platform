@@ -1,0 +1,22 @@
+# =============================================================================
+# Pip requirements for the Deep Docking active-learning environment
+# =============================================================================
+# Used by the setup wizard's virtualenv path (clusters without conda/mamba,
+# e.g. Alliance Canada, where you `module load python` then use a pip venv).
+# Mirrors dd_environment.yml; versions match what the DD code needs:
+#   * tensorflow.keras (TF2)          -> tensorflow 2.15 (last Keras-2 default)
+#   * np.bool (removed in numpy 1.24) -> numpy 1.23.5
+#   * pandas Series.append (gone 2.0) -> pandas < 2.0
+#   * [and-cuda] bundles CUDA/cuDNN wheels -> GPU with just an NVIDIA driver
+# Everything here is pip-installable from PyPI (rdkit ships an official wheel).
+# =============================================================================
+numpy==1.23.5
+pandas<2.0
+scikit-learn
+scipy
+matplotlib
+pyyaml
+tqdm
+rdkit
+tensorflow[and-cuda]==2.15.*
+meeko>=0.5

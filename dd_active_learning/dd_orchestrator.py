@@ -330,8 +330,17 @@ class JobScriptFactory:
     # Shared preamble written at the top of every script
     # ------------------------------------------------------------------
     def _preamble(self, iteration: int) -> str:
-        conda_env = self.cfg["env"]["conda_env"]
-        dd_dir    = self.cfg["env"]["dd_protocol_dir"]
+        dd_dir = self.cfg["env"]["dd_protocol_dir"]
+
+        # How to activate the Python environment inside each job.  The wizard
+        # writes env.activate (a conda-activate line, or `source venv/bin/activate`
+        # for the no-conda / virtualenv path).  Fall back to conda for older
+        # configs that only have env.conda_env.
+        activate = self.cfg["env"].get("activate")
+        if not activate:
+            conda_env = self.cfg["env"].get("conda_env", "")
+            activate = ('source "$(conda info --base)/etc/profile.d/conda.sh" '
+                        f'&& conda activate "{conda_env}"')
 
         # Cluster modules that provide the docking engine (gnina / AutoDock-GPU /
         # autogrid4, ...).  These are `module load`ed inside every job.  Guarded with `type module` so
@@ -354,11 +363,12 @@ class JobScriptFactory:
             export DD_CAMPAIGN="{self.name}"
             export DD_PROTOCOL_DIR="{dd_dir}"
 
-            # Activate conda environment
-            source "$(conda info --base)/etc/profile.d/conda.sh"
-            conda activate "{conda_env}"
-
             __DD_MODULES__
+            # Activate the Python environment (conda env or virtualenv).
+            # Modules are loaded first so an Alliance-style venv sees its
+            # matching python module, and gnina's prerequisites are in place.
+            {activate}
+
             # Abort immediately if any command fails - this ensures the
             # scheduler marks the job as FAILED rather than silently
             # continuing into a broken state, which would break the

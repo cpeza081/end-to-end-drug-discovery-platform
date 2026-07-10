@@ -275,83 +275,126 @@ else
 fi
 
 # =============================================================================
-# Step 6: Cluster modules for the docking tools
+# Step 6: Docking-engine modules - resolved automatically, no prompts
 # =============================================================================
-info "The docking tools are loaded as cluster modules inside each job."
-MOD_HINT="$DEFAULT_MODULES"
-if [ "$SITE_METHOD" = "p2rank" ]; then MOD_HINT="$DEFAULT_MODULES ${P2RANK_EXEC}"; fi
-
-if type module &>/dev/null && yes_no "Auto-detect module names? (fast: 'module avail')" "Y"; then
-    DETECTED_MODS=$(module avail 2>&1 | tr ' \t' '\n\n' \
-        | grep -iE "gnina|autodock|autogrid|p2rank|prank" | sort -u | tr '\n' ' ')
-    [ -n "$DETECTED_MODS" ] && { success "Detected: $DETECTED_MODS"; MOD_HINT="$DETECTED_MODS"; } \
-        || warn "No matching modules found; enter them manually."
-fi
-prompt_default "Modules to 'module load' in jobs (space-separated)" "$MOD_HINT"
-read -ra MODULE_ARR <<< "$REPLY_VAL"
-MODULES_YAML="[]"
-if [ "${#MODULE_ARR[@]}" -gt 0 ]; then
-    MODULES_YAML=$(printf '"%s", ' "${MODULE_ARR[@]}"); MODULES_YAML="[${MODULES_YAML%, }]"
+# You always use Gnina or AutoDock-GPU, so the module chain is deterministic.
+# The wizard resolves it from Lmod (`module spider` reports the exact
+# prerequisites + versioned name) with zero user input.  Hardcoded fallbacks
+# are used if the module system can't be queried from here.
+if [ "$DOCK_PROGRAM" = "GNINA" ]; then
+    ENGINE_MOD="gnina"
+    FALLBACK_MODS="StdEnv/2023 gcc/12.3 cuda/12.2 gnina/1.3.1"
+else
+    ENGINE_MOD="autodock-gpu"
+    FALLBACK_MODS="StdEnv/2023 gcc/12.3 cuda/12.2 autodock-gpu/1.6"
 fi
 
+DOCK_MODS="$FALLBACK_MODS"
+if type module &>/dev/null; then
+    SPIDER=$(module spider "$ENGINE_MOD" 2>&1)
+    # exact versioned name (e.g. gnina/1.3.1)
+    FULL=$(printf '%s\n' "$SPIDER" | grep -oE "${ENGINE_MOD}/[0-9][^ :]*" | head -1)
+    # the line right after "You will need to load ..." lists the prerequisites
+    PREREQ=$(printf '%s\n' "$SPIDER" | grep -A1 "You will need to load" | tail -1 | xargs)
+    if [ -n "$FULL" ]; then
+        DOCK_MODS=$(echo "$PREREQ $FULL" | xargs)
+        success "Resolved '$ENGINE_MOD' module chain automatically."
+    else
+        warn "Could not query '$ENGINE_MOD' via module spider; using known defaults."
+    fi
+fi
+info "Docking modules: $DOCK_MODS"
+read -ra MODULE_ARR <<< "$DOCK_MODS"
+# MODULES_YAML is finalized just before the config is written (a venv also needs
+# its python module loaded first).
+
 # =============================================================================
-# Step 7: Software environment (conda/mamba)
+# Step 7: Software environment - the wizard BUILDS it (conda OR a pip venv)
 # =============================================================================
-# The environment is defined once in dd_environment.yml. The spec pins the versions
-# the DD training code needs plus rdkit + meeko for ligand prep.
+# Prefer conda/mamba (from dd_environment.yml).  If neither is on PATH - common
+# on clusters that use `module load python` + pip instead of conda (e.g. the
+# Digital Research Alliance of Canada) - build a Python virtualenv from
+# dd_requirements.txt.  Either way the environment is CREATED here.
+# ENV_ACTIVATE is the command the generated job scripts use to enter it.
+ENV_YML="$SCRIPT_DIR/dd_environment.yml"
+REQ_TXT="$SCRIPT_DIR/dd_requirements.txt"
+REQUIRED_IMPORTS="import tensorflow, rdkit, meeko, sklearn, pandas, numpy"
+ENV_ACTIVATE=""
+CONDA_ENV=""
+
 PKG_MGR=""
 command -v mamba &>/dev/null && PKG_MGR="mamba"
 [ -z "$PKG_MGR" ] && command -v conda &>/dev/null && PKG_MGR="conda"
 
-ENV_YML="$SCRIPT_DIR/dd_environment.yml"
-# Read the env name straight from the spec
-DEFAULT_ENV=$(awk '/^name:/{print $2; exit}' "$ENV_YML" 2>/dev/null)
-prompt_default "Name of the conda environment for the DNN + ligand prep" "${DEFAULT_ENV:-dd-env}"
-CONDA_ENV="$REPLY_VAL"
-
-env_exists() { [ -n "$PKG_MGR" ] && conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; }
-verify_env() {
-    conda run -n "$CONDA_ENV" python -c \
-        "import tensorflow, rdkit, meeko, sklearn, pandas, numpy" 2>/dev/null
-}
-
-if [ -z "$PKG_MGR" ]; then
-    warn "Neither mamba nor conda found on PATH. Cannot build the environment here."
-    warn "Load your conda/mamba module first, then run:"
-    warn "    conda env create -n $CONDA_ENV -f $ENV_YML"
-elif [ ! -f "$ENV_YML" ]; then
-    error "Bundled environment spec not found: $ENV_YML"
-elif env_exists; then
-    success "Environment '$CONDA_ENV' already exists (using $PKG_MGR)."
-    if verify_env; then
-        success "It has the required packages (tensorflow, rdkit, meeko, sklearn, ...)."
+if [ -n "$PKG_MGR" ] && [ -f "$ENV_YML" ]; then
+    # -------------------- conda / mamba path --------------------
+    DEFAULT_ENV=$(awk '/^name:/{print $2; exit}' "$ENV_YML" 2>/dev/null)
+    prompt_default "Conda environment name" "${DEFAULT_ENV:-dd-env}"
+    CONDA_ENV="$REPLY_VAL"
+    # \$( is escaped so it stays literal in the config and runs at job time.
+    ENV_ACTIVATE="source \"\$(conda info --base)/etc/profile.d/conda.sh\" && conda activate \"$CONDA_ENV\""
+    conda_env_exists() { conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; }
+    conda_ok() { conda run -n "$CONDA_ENV" python -c "$REQUIRED_IMPORTS" 2>/dev/null; }
+    if conda_env_exists; then
+        success "Conda env '$CONDA_ENV' already exists (using $PKG_MGR)."
+        conda_ok && success "It has the required packages." \
+            || { yes_no "Update it from dd_environment.yml?" "Y" \
+                 && "$PKG_MGR" env update -n "$CONDA_ENV" -f "$ENV_YML"; }
     else
-        warn "'$CONDA_ENV' is missing some required packages."
-        if yes_no "Update it from $ENV_YML now?" "Y"; then
-            "$PKG_MGR" env update -n "$CONDA_ENV" -f "$ENV_YML" && verify_env \
-                && success "Updated and verified." \
-                || warn "Update finished but an import still fails. Check the log."
+        info "Creating conda env '$CONDA_ENV' from dd_environment.yml (~5-15 min)..."
+        if "$PKG_MGR" env create -n "$CONDA_ENV" -f "$ENV_YML" && conda_ok; then
+            success "Environment created and verified."
+        else
+            warn "Env build finished with warnings - check the log above."
         fi
     fi
 else
-    info "Building the software environment '$CONDA_ENV' from dd_environment.yml"
-    info "(rdkit + tensorflow + meeko + DD deps). This takes ~5-15 minutes."
-    if yes_no "Create it now with $PKG_MGR?" "Y"; then
-        "$PKG_MGR" env create -n "$CONDA_ENV" -f "$ENV_YML"
-        if env_exists && verify_env; then
-            success "Environment '$CONDA_ENV' created and verified."
-        elif env_exists; then
-            warn "Env created but a package import failed (see log above)."
-            warn "TensorFlow bundles its own CUDA here. No CUDA module needed."
-            warn "If GPU isn't detected at run time, check the node's NVIDIA driver."
-        else
-            error "Environment creation failed; see the messages above."
-        fi
+    # -------------------- python virtualenv path --------------------
+    [ -z "$PKG_MGR" ] && info "No conda/mamba found - building a Python virtualenv with pip."
+    # Load a python module (the venv symlinks to it and jobs must load the SAME
+    # one before activating). Record it so it goes into env.modules automatically.
+    PY_MODULE=""
+    if type module &>/dev/null; then
+        info "Loading a Python module..."
+        module load python/3.11 2>/dev/null || module load python/3.10 2>/dev/null \
+            || module load python 2>/dev/null || true
+        PY_MODULE=$(module -t list 2>&1 | grep -iE '^python/' | head -1)
+    fi
+    PYTHON=$(command -v python3 || command -v python || true)
+    if [ -z "$PYTHON" ]; then
+        error "No python3 on PATH. Run 'module load python', then re-run the wizard."
+    elif [ ! -f "$REQ_TXT" ]; then
+        error "Bundled requirements not found: $REQ_TXT"
     else
-        warn "Skipped. Create it later with:"
-        warn "    $PKG_MGR env create -n $CONDA_ENV -f $ENV_YML"
+        prompt_default "Path for the new Python virtual environment" "\$SCRATCH/dd_venv"
+        VENV_RAW="$REPLY_VAL"; VENV_DIR=$(eval echo "$VENV_RAW")
+        ENV_ACTIVATE="source \"$VENV_RAW/bin/activate\""
+        if [ ! -f "$VENV_DIR/bin/activate" ]; then
+            info "Creating virtualenv at $VENV_DIR ..."
+            "$PYTHON" -m venv "$VENV_DIR"
+        fi
+        if [ -f "$VENV_DIR/bin/activate" ]; then
+            # shellcheck disable=SC1090
+            source "$VENV_DIR/bin/activate"
+            if python -c "$REQUIRED_IMPORTS" 2>/dev/null; then
+                success "Virtualenv already has the required packages: $VENV_DIR"
+            else
+                info "Installing packages from dd_requirements.txt (~5-15 min)..."
+                pip install --upgrade pip >/dev/null 2>&1
+                pip install -r "$REQ_TXT"
+                python -c "$REQUIRED_IMPORTS" 2>/dev/null \
+                    && success "Virtualenv created and verified: $VENV_DIR" \
+                    || warn "Some imports failed - check the pip log above."
+            fi
+            deactivate 2>/dev/null || true
+        else
+            error "Failed to create virtualenv at $VENV_DIR."
+        fi
     fi
 fi
+
+# Always leave the config with a working activation command.
+[ -z "$ENV_ACTIVATE" ] && ENV_ACTIVATE="conda activate ${CONDA_ENV:-dd-env}"
 
 # =============================================================================
 # Step 8: Deep Docking parameters  (defaults + paper guidance)
@@ -390,6 +433,22 @@ if [ -f "$CONFIG_FILE" ]; then
     if ! yes_no "campaign.yaml already exists. Overwrite?" "N"; then
         CONFIG_FILE="$CAMPAIGN_DIR_EXPANDED/campaign_$(date +%Y%m%d_%H%M%S).yaml"
     fi
+fi
+
+# Finalize env.modules: the docking chain from Step 6, plus (for a venv) its
+# python module, which must load before the venv activates. Order preserved.
+FINAL_MODS=("${MODULE_ARR[@]}")
+if [ -n "${PY_MODULE:-}" ] && [[ "$ENV_ACTIVATE" == *bin/activate* ]]; then
+    n=${#MODULE_ARR[@]}
+    if [ "$n" -gt 0 ]; then
+        FINAL_MODS=("${MODULE_ARR[@]:0:n-1}" "$PY_MODULE" "${MODULE_ARR[@]:n-1}")
+    else
+        FINAL_MODS=("$PY_MODULE")
+    fi
+fi
+MODULES_YAML="[]"
+if [ "${#FINAL_MODS[@]}" -gt 0 ]; then
+    MODULES_YAML=$(printf '"%s", ' "${FINAL_MODS[@]}"); MODULES_YAML="[${MODULES_YAML%, }]"
 fi
 
 # Engine-specific docking lines.
@@ -458,6 +517,10 @@ env:
   dd_protocol_dir: "$DD_PROTOCOL_DIR"
   modules: $MODULES_YAML
 YAML
+
+# Append the activation command as a single-quoted YAML scalar so its $(...) and
+# quotes are preserved verbatim (expanded only when a job runs it).
+printf "  activate: '%s'\n" "$ENV_ACTIVATE" >> "$CONFIG_FILE"
 
 success "Config written to: $CONFIG_FILE"
 

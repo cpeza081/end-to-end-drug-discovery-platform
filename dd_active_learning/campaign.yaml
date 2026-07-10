@@ -96,11 +96,17 @@ scheduler:
 
 # --- Software environment ---------------------------------------------------
 env:
-  # Conda env must provide: rdkit, meeko, tensorflow, pandas, numpy.
-  # To build it manually:
-  #   conda env create -f dd_active_learning/dd_environment.yml
+  # The env must provide: rdkit, meeko, tensorflow, pandas, numpy.
+  # setup_active_learning.sh builds it, a conda env from dd_environment.yml,
+  # or a pip virtualenv from dd_requirements.txt.
   conda_env: "dd-env"
   dd_protocol_dir: "$SCRATCH/DD_protocol"   # Cloned DD protocol repo
+
+  # How each job enters that env (the wizard sets this automatically):
+  #   conda:  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate dd-env'
+  #   venv:   'source "$SCRATCH/dd_venv/bin/activate"'
+  # If omitted, falls back to `conda activate <conda_env>`.
+  activate: 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate dd-env'
 
   # Cluster modules `module load`ed inside every job so the docking tools
   # (gnina / autodock_gpu / autogrid4, and optionally P2Rank) are on PATH on
