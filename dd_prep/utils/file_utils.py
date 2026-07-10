@@ -43,6 +43,31 @@ def count_lines(path: Path, has_header: bool = True) -> int:
     return max(0, count - (1 if has_header else 0))
 
 
+def remove_if_output_ready(input_path: Path, output_path: Path) -> bool:
+    """
+    Delete *input_path* only if *output_path* looks like a complete result.
+
+    Used by the optional ``cleanup_intermediates`` mode so a stage can free the
+    disk held by its input once its output is safely on disk. This is an
+    effective guard against project-space quota blow-ups on multi-TB libraries.
+
+    "Complete" is defined conservatively: the output must exist and be
+    non-empty.  If the producing command failed (missing or zero-byte output)
+    the input is kept so the stage can be retried without data loss.
+
+    Returns True if the input was deleted, False otherwise.
+    """
+    try:
+        if output_path.is_file() and output_path.stat().st_size > 0:
+            input_path.unlink(missing_ok=True)
+            return True
+    except OSError:
+        # Never let a cleanup failure abort the pipeline — the worst case is
+        # that an intermediate lingers, which is safe (just uses disk).
+        pass
+    return False
+
+
 def zero_pad(index: int, total: int) -> str:
     """
     Return a zero-padded string wide enough to sort correctly up to *total*.

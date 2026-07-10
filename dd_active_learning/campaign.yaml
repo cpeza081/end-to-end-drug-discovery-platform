@@ -1,0 +1,114 @@
+# =============================================================================
+# Deep Docking Active Learning Campaign Configuration
+# =============================================================================
+# All paths are absolute. Environment variables (e.g. $SCRATCH) are expanded.
+# Edit this file before launching a campaign. Every field is documented below.
+# =============================================================================
+
+# --- Campaign identity ------------------------------------------------------
+campaign_name: "my_target_dd"          # Used for directory names and job names
+project_dir: "$SCRATCH/dd_campaigns/my_target_dd"  # Root output directory
+
+# --- Library paths (produced by the library preparation pipeline) ------------
+library:
+  smiles_dir: "$SCRATCH/library_prepared"        # .txt files, one per chunk
+  fingerprint_dir: "$SCRATCH/library_prepared_fp" # Morgan FP files matching smiles_dir
+
+# --- Docking ----------------------------------------------------------------
+# RDKit + Meeko for ligand prep and either Gnina or AutoDock-GPU for docking 
+# (both GPU-accelerated).
+docking:
+  program: "GNINA"          # "GNINA" or "AUTODOCK_GPU"
+
+  # Receptor + pre-computed binding box.  Both are produced by the one-time
+  # helper:  python dd_receptor_prep.py --config campaign.yaml
+  receptor_file: "$SCRATCH/receptor/receptor.pdb"
+  box_json:      "$SCRATCH/receptor/receptor_box.json"   # center/size of the box
+
+  # Docking-score field read by Phase 4's label extraction:
+  #   GNINA        -> "minimizedAffinity"   (Vina-like kcal/mol)
+  #   AUTODOCK_GPU -> "ADGPU_score"         (best free energy, injected by export)
+  score_keyword: "minimizedAffinity"
+
+  # -- Binding-site definition (used once by dd_receptor_prep.py) -------------
+  # Deep Docking does not choose the pocket; it is defined here, once, and
+  # reused by every iteration.  Pick a strategy under `method`:
+  site:
+    method: "reference_ligand"   # "reference_ligand", "p2rank", or "manual"
+    # reference_ligand: box envelops a known ligand in the pocket (holo/
+    # co-crystallised structure).
+    reference_ligand: "$SCRATCH/receptor/ref_ligand.sdf"
+    padding: 4.0                 # Angstroms added around the reference ligand
+    # p2rank (no reference ligand needed - predicts the pocket from the protein):
+    #   method: "p2rank"
+    #   p2rank_exec: "prank"      # P2Rank launcher on PATH
+    #   pocket_rank: 1            # which predicted pocket to target (1 = top)
+    #   box_size: [24, 24, 24]    # box dimensions (A) centred on the pocket
+    # manual (you already know the box - just give the six numbers):
+    #   method: "manual"
+    #   center: [11.5, -3.25, 7.0]   # box center x, y, z (A)
+    #   size:   [24, 24, 24]         # box size x, y, z (A)
+
+  # -- Gnina-specific options --------------------------------------------------
+  gnina_cnn: "rescore"        # none | rescore | refinement | all
+  exhaustiveness: 8
+
+  # -- AutoDock-GPU-specific options ------------------------------------------
+  maps_fld: "$SCRATCH/receptor/receptor.maps.fld"  # produced by dd_receptor_prep.py
+  autodock_bin: "autodock_gpu_128wi"               # binary name for your GPU build
+  autodock_nrun: 10                                # docking runs per ligand
+
+# --- Deep Docking parameters ------------------------------------------------
+dd:
+  total_iterations: 4       # How many AL iterations to run (paper recommends 4–11)
+  train_size: 1000000       # Molecules sampled for training per iteration
+  val_size: 1000000         # Molecules for validation AND test sets (set once in iter 1)
+  percent_first: 1.0        # % top-scorers = "virtual hit" in iteration 1 (e.g. 1.0 = top 1%)
+  percent_last: 0.01        # % top-scorers = "virtual hit" in the final iteration
+  recall: 0.90              # Fraction of true virtual hits the model must retrieve
+  num_models: 24            # Models trained per iteration (16/24/48/72/144)
+  num_cpus_sampling: 60     # Cores for sampling/fingerprint extraction steps
+
+# --- Cluster / scheduler ----------------------------------------------------
+scheduler:
+  type: "SLURM"             # "SLURM", "PBS", or "SGE"  (PBS/SGE = limited support)
+  account: "rrg-checco89"   # Billing account (SLURM: --account; PBS: -A)
+  cpu_partition: "cpu"      # Partition/queue for CPU jobs (sampling, ligand prep)
+  gpu_partition: "gpu"      # Partition/queue for GPU jobs (docking, training, inference)
+
+  # Walltime limits per phase. Adjust this based on your system and library size
+  walltime:
+    phase1_sampling: "00:30:00"
+    phase2_ligand_prep: "08:00:00"
+    phase3_docking: "24:00:00"
+    phase4_training: "20:00:00"
+    phase5_inference: "06:00:00"
+    final_extraction: "02:00:00"
+
+  # Resource requests per phase
+  resources:
+    phase1_sampling:  {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
+    phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G",  gpus: 0}
+    phase3_docking:   {nodes: 1, cpus: 16,  mem: "64G",  gpus: 1}   # GPU: Gnina / AutoDock-GPU
+    phase4_training:  {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
+    phase5_inference: {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
+    final_extraction: {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
+
+# --- Software environment ---------------------------------------------------
+env:
+  # The env must provide: rdkit, meeko, tensorflow, pandas, numpy.
+  # setup_active_learning.sh builds it, a conda env from dd_environment.yml,
+  # or a pip virtualenv from dd_requirements.txt.
+  conda_env: "dd-env"
+  dd_protocol_dir: "$SCRATCH/DD_protocol"   # Cloned DD protocol repo
+
+  # How each job enters that env (the wizard sets this automatically):
+  #   conda:  'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate dd-env'
+  #   venv:   'source "$SCRATCH/dd_venv/bin/activate"'
+  # If omitted, falls back to `conda activate <conda_env>`.
+  activate: 'source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate dd-env'
+
+  # Cluster modules `module load`ed inside every job so the docking tools
+  # (gnina / autodock_gpu / autogrid4, and optionally P2Rank) are on PATH on
+  # the compute node.  Leave as [] if they are already on PATH.
+  modules: ["gnina"]        # e.g. ["gnina"]  or  ["autodock-gpu", "autodock"]

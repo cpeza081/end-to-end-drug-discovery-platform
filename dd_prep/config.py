@@ -79,6 +79,13 @@ class FilterConfig:
     # Only keep neutral molecules. Charged species would require counter-ions that complicate docking.
     formal_charge: int = 0
 
+    # Number of worker processes used to parse SMILES and compute descriptors.
+    # RDKit parsing/descriptor calculation is CPU-bound and single-threaded per
+    # molecule, so this is the single biggest lever on filter wall-clock time.
+    # Set to the number of physical cores available to the job (match
+    # --cpus-per-task in the SLURM script). 1 = serial (old behaviour).
+    n_workers: int = 4
+
 
 @dataclass
 class SplitConfig:
@@ -180,6 +187,20 @@ class OrganizeConfig:
     """
     enabled: bool = True
 
+    # How each processed chunk is placed into library_prepared/:
+    #   "hardlink" — create a hard link (no data copied, no extra disk used).
+    #                Both the intermediate and library_prepared/ names point at
+    #                the same bytes on disk. This is the safe default: it keeps
+    #                intermediates for resume while avoiding a full second copy.
+    #                Falls back to a copy automatically if the work_dir spans a
+    #                filesystem boundary (hard links can't cross devices).
+    #   "move"     — move the file (rename). No extra disk used and the
+    #                intermediate is removed. Most disk-efficient, but the
+    #                upstream step can no longer be re-run from its output.
+    #   "copy"     — physically copy (original behaviour). Doubles disk usage
+    #                for this stage; only needed if you want an independent copy.
+    mode: str = "hardlink"
+
 
 @dataclass
 class FingerprintConfig:
@@ -244,6 +265,20 @@ class PipelineConfig:
     # Helps to clarify the effects of a config on a new cluster before submitting a long job.
     dry_run: bool = False
 
+    # Delete each stage's input files once its output has been safely written.
+    # This is the main defence against project-space quota blow-ups on
+    # multi-TB libraries, where the uncleaned filtered file + chunk files +
+    # _isom + _states files can otherwise coexist at 5-10x the raw library
+    # size. When enabled,
+    #   - split   removes the filtered library after all chunks are written
+    #   - flipper removes each chunk .smi after its _isom.smi is produced
+    #   - tautomer removes each _isom.smi after its _states.smi is produced
+    #   - organize's "move"/"hardlink" mode avoids re-copying _states files
+    # Once an input is deleted the producing step can no longer be
+    # re-run from scratch (its output-based resume still works). Off by default
+    # so nothing is deleted unless you opt in.
+    cleanup_intermediates: bool = False
+
     # ── Stage configs ─────────────────────────────────────────────────────────
     filter: FilterConfig = field(default_factory=FilterConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
@@ -279,6 +314,7 @@ def _dict_to_config(d: dict) -> PipelineConfig:
         "flipper": FlipperConfig,
         "tautomer": TautomerConfig,
         "omega": OmegaConfig,
+        "organize": OrganizeConfig,
         "fingerprint": FingerprintConfig,
     }
     for key, value in d.items():

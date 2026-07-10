@@ -24,6 +24,16 @@ dev = [
     "ruff",            # linter / formatter
     "mypy>=1.0",
 ]
+
+# Active-learning docking loop (dd_active_learning): open-source ligand prep
+# and docking-result handling.  Install with: pip install -e ".[docking]"
+# NOTE: the docking engines themselves are not pip packages and must be
+# provided by the environment / cluster modules:
+#   gnina, autodock_gpu (+ autogrid4), and optionally prank (P2Rank).
+docking = [
+    "meeko>=0.5",      # SMILES/RDKit -> PDBQT and .dlg -> scored SDF
+    "numpy>=1.23",     # pulled by rdkit/meeko; pinned here for reproducibility
+]
  
 [project.scripts]
 # Enables: dd-prep --config my_config.yaml  (once cli.py is written)

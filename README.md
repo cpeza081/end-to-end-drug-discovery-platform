@@ -55,7 +55,8 @@ The wizard generates a 'my_run.yaml' config file with sensible defaults. You can
 
 ```bash
 cd ~/end-to-end-drug-discovery-platform
-bash slurm/submit_pipeline.sh
+nano my_run.yaml # Edit your config file so you can adjust the filter as well as resource allocation if necessary
+bash slurm/submit_pipeline.sh --config my_run.yaml
 ``` 
 
 You will see confirmation that the jobs were submitted. The pipeline will then run automatically from start to finish.

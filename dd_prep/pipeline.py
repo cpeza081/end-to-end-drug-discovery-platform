@@ -255,6 +255,7 @@ class Pipeline:
         ctx.set("n_parallel", self.config.n_parallel)
         ctx.set("dry_run",    self.config.dry_run)
         ctx.set("resume",     self.config.resume)
+        ctx.set("cleanup_intermediates", self.config.cleanup_intermediates)
         return ctx
 
     def _repopulate_context(

@@ -27,6 +27,7 @@ from pathlib import Path
 
 from dd_prep.config import FlipperConfig
 from dd_prep.steps.base import PipelineContext, PipelineStep
+from dd_prep.utils.file_utils import remove_if_output_ready
 from dd_prep.utils.parallel import run_parallel
 
 
@@ -53,6 +54,7 @@ class FlipperStep(PipelineStep):
         resume: bool = ctx.get("resume", True)
         n_parallel: int = ctx.get("n_parallel", 4)
         dry_run: bool = ctx.get("dry_run", False)
+        cleanup: bool = ctx.get("cleanup_intermediates", False)
 
         # In Slurm array mode, restrict to the one chunk for this task.
         chunk_index: int | None = ctx.get("chunk_index")
@@ -68,6 +70,7 @@ class FlipperStep(PipelineStep):
 
         commands: list[list[str]] = []
         isom_files: list[Path] = []
+        processed: list[tuple[Path, Path]] = []  # (input chunk, output isom) pairs we actually run
 
         for chunk in chunk_files:
             out = chunk.parent / chunk.name.replace(".smi", "_isom.smi")
@@ -78,19 +81,34 @@ class FlipperStep(PipelineStep):
                 continue
 
             cmd = ["flipper", "-in", str(chunk), "-out", str(out)]
-            if cfg.warts: 
+            if cfg.warts:
                 cmd.append("-warts")
             if cfg.enum_nitrogen:
                 cmd.append("-enumNitrogen")
             if cfg.extra_args:
                 cmd.extend(cfg.extra_args.split())
             commands.append(cmd)
+            processed.append((chunk, out))
 
         if commands: # If there are any commands to run (i.e. any files that need processing), execute them in parallel; otherwise, skip and just populate the context with the existing files.
-            self.logger.info("Running FLIPPER on %d chunk(s) …", len(commands)) 
-            run_parallel(commands, n_parallel, dry_run, desc="Flipper") 
+            self.logger.info("Running FLIPPER on %d chunk(s) …", len(commands))
+            run_parallel(commands, n_parallel, dry_run, desc="Flipper")
         else:
-            self.logger.info("All isomer files already present — skipping FLIPPER.")
+            self.logger.info("All isomer files already present. Skipping FLIPPER.")
 
-        ctx.set("isom_files", isom_files) 
+        # ── Optional cleanup ──────────────────────────────────────────────────
+        # Each _isom.smi supersedes its source chunk. Delete the chunk once the
+        # isomer file is confirmed complete, so the raw chunks don't sit on disk
+        # alongside the (typically larger) enumerated output. Skipped in dry-run.
+        if cleanup and not dry_run:
+            removed = sum(
+                remove_if_output_ready(chunk, out) for chunk, out in processed
+            )
+            if removed:
+                self.logger.info(
+                    "  cleanup_intermediates: removed %d source chunk(s) after enumeration.",
+                    removed,
+                )
+
+        ctx.set("isom_files", isom_files)
         return ctx
