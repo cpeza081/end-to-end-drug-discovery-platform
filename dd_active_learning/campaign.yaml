@@ -97,6 +97,8 @@ scheduler:
 # --- Software environment ---------------------------------------------------
 env:
   # Conda env must provide: rdkit, meeko, tensorflow, pandas, numpy.
+  # To build it manually:
+  #   conda env create -f dd_active_learning/dd_environment.yml
   conda_env: "dd-env"
   dd_protocol_dir: "$SCRATCH/DD_protocol"   # Cloned DD protocol repo
 

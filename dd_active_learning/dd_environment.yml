@@ -1,0 +1,42 @@
+# =============================================================================
+# Deep Docking active-learning conda environment
+# =============================================================================
+# Matches the DD_protocol requirements (Gentile et al., Nat. Protoc. 17,
+# 672-697, 2022) plus the open-source ligand-prep stack this platform uses.
+#
+# This file is the canonical spec.  Versions are pinned to what
+# the DD training code (scripts_2/progressive_docking.py) actually needs:
+#
+#   * it imports tensorflow.keras (the TF2 API)      -> tensorflow 2.x
+#   * it uses np.bool (removed in numpy >= 1.24)      -> numpy < 1.24
+#   * it uses pandas Series.append (gone in >= 2.0)   -> pandas < 2.0
+#
+# Create it with:
+#   mamba env create -n dd-env -f dd_environment.yml      # (or conda)
+# The setup wizard does this for you.
+#
+# GPU note: tensorflow[and-cuda] bundles CUDA 12 + cuDNN as pip wheels inside
+# this env, so GPU training works with only an NVIDIA driver present on the
+# compute node, so you do NOT need to `module load cuda`/cudnn.  (It
+# falls back to CPU if no GPU is visible, e.g. for a CPU smoke test.)
+# =============================================================================
+name: dd-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - rdkit
+  - numpy=1.23.5        # has np.bool (removed in 1.24); >=1.23.5 satisfies TF 2.15
+  - pandas=1.5.*        # DD code uses Series.append (removed in pandas 2.0)
+  - scikit-learn
+  - matplotlib
+  - scipy              # required by Meeko
+  - pyyaml
+  - tqdm
+  - pip
+  - pip:
+      # [and-cuda] pulls the nvidia-*-cu12 CUDA/cuDNN wheels into this env, so
+      # GPU works with just an NVIDIA driver - no cluster CUDA module needed.
+      # 2.15 is the last TF that defaults to Keras 2 (tf.keras), which DD uses.
+      - tensorflow[and-cuda]==2.15.*
+      - meeko>=0.5           # RDKit -> PDBQT and .dlg -> scored SDF

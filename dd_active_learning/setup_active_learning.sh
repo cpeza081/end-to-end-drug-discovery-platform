@@ -297,45 +297,59 @@ fi
 # =============================================================================
 # Step 7: Software environment (conda/mamba)
 # =============================================================================
+# The environment is defined once in dd_environment.yml. The spec pins the versions
+# the DD training code needs plus rdkit + meeko for ligand prep.
 PKG_MGR=""
 command -v mamba &>/dev/null && PKG_MGR="mamba"
 [ -z "$PKG_MGR" ] && command -v conda &>/dev/null && PKG_MGR="conda"
 
-prompt_default "Name of the conda environment for the DNN + ligand prep" "dd-env"
+ENV_YML="$SCRIPT_DIR/dd_environment.yml"
+# Read the env name straight from the spec
+DEFAULT_ENV=$(awk '/^name:/{print $2; exit}' "$ENV_YML" 2>/dev/null)
+prompt_default "Name of the conda environment for the DNN + ligand prep" "${DEFAULT_ENV:-dd-env}"
 CONDA_ENV="$REPLY_VAL"
 
 env_exists() { [ -n "$PKG_MGR" ] && conda env list 2>/dev/null | grep -qE "^${CONDA_ENV}[[:space:]]"; }
+verify_env() {
+    conda run -n "$CONDA_ENV" python -c \
+        "import tensorflow, rdkit, meeko, sklearn, pandas, numpy" 2>/dev/null
+}
 
 if [ -z "$PKG_MGR" ]; then
-    warn "Neither mamba nor conda found on PATH; skipping environment setup."
-    warn "Create '$CONDA_ENV' yourself with rdkit, meeko, tensorflow, numpy, scipy, pyyaml."
+    warn "Neither mamba nor conda found on PATH. Cannot build the environment here."
+    warn "Load your conda/mamba module first, then run:"
+    warn "    conda env create -n $CONDA_ENV -f $ENV_YML"
+elif [ ! -f "$ENV_YML" ]; then
+    error "Bundled environment spec not found: $ENV_YML"
 elif env_exists; then
     success "Environment '$CONDA_ENV' already exists (using $PKG_MGR)."
-    if ! conda run -n "$CONDA_ENV" python -c "import meeko" &>/dev/null; then
-        if yes_no "Meeko is missing from '$CONDA_ENV'. Install it now? (~1 min)" "Y"; then
-            conda run -n "$CONDA_ENV" pip install meeko numpy scipy
+    if verify_env; then
+        success "It has the required packages (tensorflow, rdkit, meeko, sklearn, ...)."
+    else
+        warn "'$CONDA_ENV' is missing some required packages."
+        if yes_no "Update it from $ENV_YML now?" "Y"; then
+            "$PKG_MGR" env update -n "$CONDA_ENV" -f "$ENV_YML" && verify_env \
+                && success "Updated and verified." \
+                || warn "Update finished but an import still fails. Check the log."
         fi
     fi
 else
-    warn "Environment '$CONDA_ENV' does not exist."
-    if yes_no "Create it now with $PKG_MGR from DD_protocol's environment.yml + Meeko? (~5-15 min)" "Y"; then
-        DD_DIR_EXPANDED=$(eval echo "$DD_PROTOCOL_DIR")
-        ENV_YML="$DD_DIR_EXPANDED/environment.yml"
-        if [ -f "$ENV_YML" ]; then
-            info "Creating '$CONDA_ENV' from $ENV_YML (this can take several minutes)..."
-            "$PKG_MGR" env create -n "$CONDA_ENV" -f "$ENV_YML"
+    info "Building the software environment '$CONDA_ENV' from dd_environment.yml"
+    info "(rdkit + tensorflow + meeko + DD deps). This takes ~5-15 minutes."
+    if yes_no "Create it now with $PKG_MGR?" "Y"; then
+        "$PKG_MGR" env create -n "$CONDA_ENV" -f "$ENV_YML"
+        if env_exists && verify_env; then
+            success "Environment '$CONDA_ENV' created and verified."
+        elif env_exists; then
+            warn "Env created but a package import failed (see log above)."
+            warn "TensorFlow bundles its own CUDA here. No CUDA module needed."
+            warn "If GPU isn't detected at run time, check the node's NVIDIA driver."
         else
-            warn "No environment.yml in DD_protocol; creating a minimal env instead."
-            "$PKG_MGR" create -y -n "$CONDA_ENV" -c conda-forge \
-                python=3.9 rdkit numpy scipy pyyaml pandas tensorflow
+            error "Environment creation failed; see the messages above."
         fi
-        if env_exists; then
-            info "Adding Meeko (RDKit->PDBQT and .dlg export)..."
-            conda run -n "$CONDA_ENV" pip install meeko numpy scipy
-            success "Environment '$CONDA_ENV' is ready."
-        else
-            error "Environment creation failed; create '$CONDA_ENV' manually before launching."
-        fi
+    else
+        warn "Skipped. Create it later with:"
+        warn "    $PKG_MGR env create -n $CONDA_ENV -f $ENV_YML"
     fi
 fi
 
