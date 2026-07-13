@@ -1,22 +1,30 @@
 # =============================================================================
-# Pip requirements for the Deep Docking active-learning environment
+# Pip requirements for the Deep Docking active-learning virtualenv
 # =============================================================================
-# Used by the setup wizard's virtualenv path (clusters without conda/mamba,
-# e.g. Alliance Canada, where you `module load python` then use a pip venv).
-# Mirrors dd_environment.yml; versions match what the DD code needs:
-#   * tensorflow.keras (TF2)          -> tensorflow 2.15 (last Keras-2 default)
-#   * np.bool (removed in numpy 1.24) -> numpy 1.23.5
+# Used by the setup wizard's venv path (clusters without conda, e.g. the
+# Digital Research Alliance of Canada, which installs from a local wheelhouse
+# of "+computecanada" wheels rather than PyPI).
+#
+# Version RANGES (not ==) so a wheelhouse can satisfy them, e.g. Alliance's
+# numpy 1.23.2+computecanada satisfies "numpy<1.24".  Constraints match what the
+# DD code needs:
+#   * tensorflow.keras (Keras 2)      -> tensorflow < 2.14
+#   * np.bool (removed in numpy 1.24) -> numpy < 1.24
 #   * pandas Series.append (gone 2.0) -> pandas < 2.0
-#   * [and-cuda] bundles CUDA/cuDNN wheels -> GPU with just an NVIDIA driver
-# Everything here is pip-installable from PyPI (rdkit ships an official wheel).
+#
+# CUDA is NOT bundled here (no tensorflow[and-cuda]); it comes from the cuda
+# module that is already loaded for the docking engine (gnina / AutoDock-GPU).
+#
+# Tip (Alliance): check what the wheelhouse actually has with
+#   avail_wheels numpy pandas "tensorflow<2.14" rdkit meeko scikit-learn
 # =============================================================================
-numpy==1.23.5
+numpy<1.24
 pandas<2.0
-scikit-learn
 scipy
 matplotlib
+scikit-learn
 pyyaml
 tqdm
 rdkit
-tensorflow[and-cuda]==2.15.*
+tensorflow>=2.8,<2.14
 meeko>=0.5
