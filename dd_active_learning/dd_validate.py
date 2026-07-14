@@ -190,14 +190,39 @@ class Validator:
             self.warn(f"Scheduler command not found on PATH: {submit_cmd} "
                       f"(OK if running from a login node)")
 
-        # Python packages (open-source ligand-prep + docking-export stack).
-        packages = ["yaml", "pandas", "numpy", "rdkit", "meeko"]
-        for pkg in packages:
+        # import Python packages through the campaign's env exactly as a
+        # job would, not in this interpreter.
+        env_cfg = self.cfg["env"]
+        activate = env_cfg.get("activate", "")
+        modules = env_cfg.get("modules") or []
+        job_pkgs = "import numpy, pandas, sklearn, rdkit, meeko, tensorflow"
+        if activate:
+            parts = []
+            if modules:
+                parts.append("module load " + " ".join(modules))
+            parts.append(activate)
+            parts.append(f'python -c "{job_pkgs}"')
+            cmd = " && ".join(parts)
             try:
-                __import__(pkg)
-                self.ok(f"Python package: {pkg}")
-            except ImportError:
-                self.fail(f"Python package not importable: {pkg}")
+                r = subprocess.run(["bash", "-lc", cmd],
+                                   capture_output=True, text=True, timeout=180)
+                if r.returncode == 0:
+                    self.ok("Campaign env imports OK (numpy, pandas, sklearn, "
+                            "rdkit, meeko, tensorflow)")
+                else:
+                    last = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
+                    self.fail(f"Campaign env is missing a package -> {last}")
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                self.warn(f"Could not test campaign-env imports ({exc}); "
+                          f"activate the env and run: python -c '{job_pkgs}'")
+        else:
+            # No activation configured. fall back to this interpreter.
+            for pkg in ("yaml", "pandas", "numpy", "rdkit", "meeko"):
+                try:
+                    __import__(pkg)
+                    self.ok(f"Python package: {pkg}")
+                except ImportError:
+                    self.fail(f"Python package not importable: {pkg}")
 
     # ------------------------------------------------------------------
     def check_environment(self):
