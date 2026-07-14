@@ -27,5 +27,6 @@ matplotlib
 scikit-learn
 pyyaml
 tqdm
-rdkit
 tensorflow==2.15.*
+# NOTE: rdkit is not here. On Alliance it is a module, loaded before the venv is activated. The
+# wizard handles that and puts it in env.modules.

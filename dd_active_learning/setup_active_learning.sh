@@ -365,14 +365,22 @@ if [ -n "$PKG_MGR" ] && [ -f "$ENV_YML" ]; then
 else
     # -------------------- python virtualenv path --------------------
     [ -z "$PKG_MGR" ] && info "No conda/mamba found - building a Python virtualenv with pip."
-    # Load a python module (the venv symlinks to it and jobs must load the SAME
-    # one before activating). Record it so it goes into env.modules automatically.
-    PY_MODULE=""
+    # Load the modules the venv needs at build time here as well as at job run time.
+    #   python  - the venv symlinks to it
+    #   rdkit   - on Alliance, RDKit is a module, it must be
+    #             loaded before the venv is activated. gcc is its prerequisite.
+    # We capture the resolved names so they go into env.modules automatically.
+    PY_MODULE=""; RDKIT_MODULE=""
     if type module &>/dev/null; then
-        info "Loading a Python module..."
+        info "Loading python + rdkit modules (gcc prerequisite)..."
+        module load gcc 2>/dev/null || true
         module load python/3.11 2>/dev/null || module load python/3.10 2>/dev/null \
             || module load python 2>/dev/null || true
         PY_MODULE=$(module -t list 2>&1 | grep -iE '^python/' | head -1)
+        RDKIT_FULL=$(module spider rdkit 2>&1 | grep -oE "rdkit/[0-9][^ :]*" | head -1)
+        [ -n "$RDKIT_FULL" ] && module load "$RDKIT_FULL" 2>/dev/null
+        RDKIT_MODULE=$(module -t list 2>&1 | grep -iE '^rdkit/' | head -1)
+        [ -n "$RDKIT_MODULE" ] && success "RDKit will come from module: $RDKIT_MODULE"
     fi
     PYTHON=$(command -v python3 || command -v python || true)
     if [ -z "$PYTHON" ]; then
@@ -383,6 +391,25 @@ else
         prompt_default "Path for the new Python virtual environment" "\$SCRATCH/dd_venv"
         VENV_RAW="$REPLY_VAL"; VENV_DIR=$(eval echo "$VENV_RAW")
         ENV_ACTIVATE="source \"$VENV_RAW/bin/activate\""
+
+        # If a venv already exists, offer to delete + rebuild it (confirmed, and
+        # only if the path really looks like a venv and isn't something dangerous).
+        if [ -f "$VENV_DIR/bin/activate" ]; then
+            warn "A virtual environment already exists at: $VENV_DIR"
+            if yes_no "Delete it and rebuild from scratch?" "N"; then
+                case "$VENV_DIR" in
+                    ""|"/"|"$HOME"|"${SCRATCH:-/scratch}")
+                        error "Refusing to delete '$VENV_DIR' (unsafe path). Skipping." ;;
+                    *)
+                        if [ -f "$VENV_DIR/pyvenv.cfg" ]; then
+                            info "Removing $VENV_DIR ..."; rm -rf -- "$VENV_DIR"
+                        else
+                            warn "$VENV_DIR has no pyvenv.cfg (not a venv?); NOT deleting."
+                        fi ;;
+                esac
+            fi
+        fi
+
         if [ ! -f "$VENV_DIR/bin/activate" ]; then
             info "Creating virtualenv at $VENV_DIR ..."
             "$PYTHON" -m venv "$VENV_DIR"
@@ -394,11 +421,10 @@ else
                 info "Installing core packages from dd_requirements.txt (~5-15 min)..."
                 pip install --upgrade pip >/dev/null 2>&1 || true
                 pip install -r "$REQ_TXT"
-                # Meeko is usually absent from cluster wheelhouses. Fetch it from
-                # PyPI.
+                # Meeko + gemmi from PyPI, with --no-deps.
                 if ! python -c "import meeko" 2>/dev/null; then
-                    info "Installing Meeko from PyPI..."
-                    PIP_CONFIG_FILE=/dev/null pip install meeko \
+                    info "Installing Meeko (+gemmi) from PyPI..."
+                    PIP_CONFIG_FILE=/dev/null pip install --no-deps gemmi meeko \
                         || warn "Meeko install failed - install it manually into the venv."
                 fi
             fi
@@ -407,7 +433,7 @@ else
             _install_numpy_shim
             python -c "$REQUIRED_IMPORTS" 2>/dev/null \
                 && success "Virtualenv ready and verified: $VENV_DIR" \
-                || warn "Some imports still fail - check the log above."
+                || warn "Some imports still fail. Check the log above (rdkit must come from its module)."
             deactivate 2>/dev/null || true
         else
             error "Failed to create virtualenv at $VENV_DIR."
@@ -457,15 +483,21 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
 fi
 
-# Finalize env.modules: the docking chain from Step 6, plus (for a venv) its
-# python module, which must load before the venv activates. Order preserved.
+# Finalize env.modules: the docking chain from Step 6, plus (for a venv) the
+# python and rdkit modules, which load before the venv activates. Order
+# preserved.
 FINAL_MODS=("${MODULE_ARR[@]}")
-if [ -n "${PY_MODULE:-}" ] && [[ "$ENV_ACTIVATE" == *bin/activate* ]]; then
-    n=${#MODULE_ARR[@]}
-    if [ "$n" -gt 0 ]; then
-        FINAL_MODS=("${MODULE_ARR[@]:0:n-1}" "$PY_MODULE" "${MODULE_ARR[@]:n-1}")
-    else
-        FINAL_MODS=("$PY_MODULE")
+if [[ "$ENV_ACTIVATE" == *bin/activate* ]]; then
+    EXTRA_MODS=()
+    [ -n "${PY_MODULE:-}" ]    && EXTRA_MODS+=("$PY_MODULE")
+    [ -n "${RDKIT_MODULE:-}" ] && EXTRA_MODS+=("$RDKIT_MODULE")
+    if [ "${#EXTRA_MODS[@]}" -gt 0 ]; then
+        n=${#MODULE_ARR[@]}
+        if [ "$n" -gt 0 ]; then
+            FINAL_MODS=("${MODULE_ARR[@]:0:n-1}" "${EXTRA_MODS[@]}" "${MODULE_ARR[@]:n-1}")
+        else
+            FINAL_MODS=("${EXTRA_MODS[@]}")
+        fi
     fi
 fi
 MODULES_YAML="[]"
