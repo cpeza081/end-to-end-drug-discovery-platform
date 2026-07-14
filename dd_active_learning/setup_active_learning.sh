@@ -84,6 +84,20 @@ yes_no() {   # yes_no "question" "Y"|"N"  -> returns 0 for yes
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
+# Install a startup shim into the python env that restores the
+# numpy aliases (np.bool, np.int, ...) removed in numpy>=1.24, so the unmodified
+# DD_protocol code keeps working on the modern numpy that TF 2.15 requires.
+# We use a .pth file: a .pth "import ..." line runs at
+# every interpreter startup.
+_install_numpy_shim() {
+    local sp
+    sp=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])" 2>/dev/null) || return 0
+    [ -z "$sp" ] && return 0
+    printf '%s\n' "import numpy as _np, builtins as _b; ('bool' in _np.__dict__) or setattr(_np,'bool',_np.bool_); ('int' in _np.__dict__) or setattr(_np,'int',_b.int); ('float' in _np.__dict__) or setattr(_np,'float',_np.float64); ('object' in _np.__dict__) or setattr(_np,'object',_b.object); ('str' in _np.__dict__) or setattr(_np,'str',_b.str); ('complex' in _np.__dict__) or setattr(_np,'complex',_np.complex128)" \
+        > "$sp/dd_numpy_compat.pth"
+    success "Installed numpy-compat shim (restores np.bool for the DD scripts)."
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo ""
@@ -376,16 +390,24 @@ else
         if [ -f "$VENV_DIR/bin/activate" ]; then
             # shellcheck disable=SC1090
             source "$VENV_DIR/bin/activate"
-            if python -c "$REQUIRED_IMPORTS" 2>/dev/null; then
-                success "Virtualenv already has the required packages: $VENV_DIR"
-            else
-                info "Installing packages from dd_requirements.txt (~5-15 min)..."
-                pip install --upgrade pip >/dev/null 2>&1
+            if ! python -c "$REQUIRED_IMPORTS" 2>/dev/null; then
+                info "Installing core packages from dd_requirements.txt (~5-15 min)..."
+                pip install --upgrade pip >/dev/null 2>&1 || true
                 pip install -r "$REQ_TXT"
-                python -c "$REQUIRED_IMPORTS" 2>/dev/null \
-                    && success "Virtualenv created and verified: $VENV_DIR" \
-                    || warn "Some imports failed - check the pip log above."
+                # Meeko is usually absent from cluster wheelhouses. Fetch it from
+                # PyPI.
+                if ! python -c "import meeko" 2>/dev/null; then
+                    info "Installing Meeko from PyPI..."
+                    PIP_CONFIG_FILE=/dev/null pip install meeko \
+                        || warn "Meeko install failed - install it manually into the venv."
+                fi
             fi
+            # Restore numpy aliases (np.bool, ...) that the DD code needs but
+            # modern numpy removed. Runs at every python startup in this env.
+            _install_numpy_shim
+            python -c "$REQUIRED_IMPORTS" 2>/dev/null \
+                && success "Virtualenv ready and verified: $VENV_DIR" \
+                || warn "Some imports still fail - check the log above."
             deactivate 2>/dev/null || true
         else
             error "Failed to create virtualenv at $VENV_DIR."

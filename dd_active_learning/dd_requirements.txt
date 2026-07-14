@@ -1,30 +1,31 @@
 # =============================================================================
 # Pip requirements for the Deep Docking active-learning virtualenv
 # =============================================================================
-# Used by the setup wizard's venv path (clusters without conda, e.g. the
-# Digital Research Alliance of Canada, which installs from a local wheelhouse
-# of "+computecanada" wheels rather than PyPI).
+# Targets the Digital Research Alliance of Canada / "+computecanada" wheels).
 #
-# Version RANGES (not ==) so a wheelhouse can satisfy them, e.g. Alliance's
-# numpy 1.23.2+computecanada satisfies "numpy<1.24".  Constraints match what the
-# DD code needs:
-#   * tensorflow.keras (Keras 2)      -> tensorflow < 2.14
-#   * np.bool (removed in numpy 1.24) -> numpy < 1.24
-#   * pandas Series.append (gone 2.0) -> pandas < 2.0
+#   tensorflow==2.15.*  -> newest TF that still defaults to Keras 2 (tf.keras),
+#                          which the DD training code uses. 2.16+ = Keras 3 and
+#                          would break it.  2.15 is in the Alliance wheelhouse.
+#   numpy<2             -> TF 2.15 needs numpy >=1.23.5,<2.  These numpys no
+#                          longer have np.bool (removed in 1.24). The wizard
+#                          installs a startup shim (sitecustomize) that restores
+#                          np.bool / np.int / ... so the unmodified DD code runs.
 #
-# CUDA is NOT bundled here (no tensorflow[and-cuda]); it comes from the cuda
-# module that is already loaded for the docking engine (gnina / AutoDock-GPU).
+# CUDA is provided by the cuda module already loaded for the docking engine
+# (gnina / AutoDock-GPU). no tensorflow[and-cuda] here.
 #
-# Tip (Alliance): check what the wheelhouse actually has with
-#   avail_wheels numpy pandas "tensorflow<2.14" rdkit meeko scikit-learn
+# Meeko is installed separately by the wizard (usually not in the wheelhouse,
+# so it comes from PyPI).  Do not add it here.
+#
+# Check availability first:  avail_wheels numpy pandas scipy scikit-learn \
+#     matplotlib "tensorflow==2.15.*" rdkit
 # =============================================================================
-numpy<1.24
-pandas<2.0
+numpy<2
+pandas
 scipy
 matplotlib
 scikit-learn
 pyyaml
 tqdm
 rdkit
-tensorflow>=2.8,<2.14
-meeko>=0.5
+tensorflow==2.15.*
