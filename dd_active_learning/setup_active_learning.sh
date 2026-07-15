@@ -310,11 +310,14 @@ if type module &>/dev/null; then
     FULL=$(printf '%s\n' "$SPIDER" | grep -oE "${ENGINE_MOD}/[0-9][^ :]*" | head -1)
     # the line right after "You will need to load ..." lists the prerequisites
     PREREQ=$(printf '%s\n' "$SPIDER" | grep -A1 "You will need to load" | tail -1 | xargs)
-    if [ -n "$FULL" ]; then
+    # Only trust the resolved chain if we got both the versioned name and its
+    # prerequisites, otherwise keep the hardcoded fallback (which always has the
+    # prereqs).
+    if [ -n "$FULL" ] && [ -n "$PREREQ" ]; then
         DOCK_MODS=$(echo "$PREREQ $FULL" | xargs)
         success "Resolved '$ENGINE_MOD' module chain automatically."
     else
-        warn "Could not query '$ENGINE_MOD' via module spider; using known defaults."
+        warn "Could not fully resolve '$ENGINE_MOD' prerequisites. Using known defaults."
     fi
 fi
 info "Docking modules: $DOCK_MODS"
@@ -325,9 +328,9 @@ read -ra MODULE_ARR <<< "$DOCK_MODS"
 # =============================================================================
 # Step 7: Software environment - the wizard BUILDS it (conda OR a pip venv)
 # =============================================================================
-# Prefer conda/mamba (from dd_environment.yml).  If neither is on PATH - common
+# Prefer conda/mamba (from dd_environment.yml).  If neither is on PATH (common
 # on clusters that use `module load python` + pip instead of conda (e.g. the
-# Digital Research Alliance of Canada) - build a Python virtualenv from
+# Digital Research Alliance of Canada)) build a Python virtualenv from
 # dd_requirements.txt.  Either way the environment is CREATED here.
 # ENV_ACTIVATE is the command the generated job scripts use to enter it.
 ENV_YML="$SCRIPT_DIR/dd_environment.yml"

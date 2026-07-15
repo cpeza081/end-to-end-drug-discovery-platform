@@ -210,8 +210,16 @@ class Validator:
                     self.ok("Campaign env imports OK (numpy, pandas, sklearn, "
                             "rdkit, meeko, tensorflow)")
                 else:
-                    last = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
-                    self.fail(f"Campaign env is missing a package -> {last}")
+                    err = (r.stderr or "").strip()
+                    is_module = ("module" in err.lower()
+                                 or "Lmod" in err or "spider" in err)
+                    reason = ("module load failed (check env.modules order / "
+                              "prerequisites)" if is_module
+                              else "a Python package is missing")
+                    tail = "\n".join("          " + l
+                                     for l in err.splitlines()[-10:])
+                    self.fail(f"Campaign env setup failed: {reason}. "
+                              f"Ran:\n          {cmd}\n{tail}")
             except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
                 self.warn(f"Could not test campaign-env imports ({exc}); "
                           f"activate the env and run: python -c '{job_pkgs}'")
