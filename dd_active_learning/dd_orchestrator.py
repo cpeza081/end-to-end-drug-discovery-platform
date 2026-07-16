@@ -430,7 +430,7 @@ class JobScriptFactory:
             data_dir     = fp_dir
             tot_sampling = train_sz + 2 * val_sz
         else:
-            data_dir     = f"{self.proj}/iteration_{iteration - 1:02d}/morgan_1024_predictions"
+            data_dir     = f"{self.proj}/{self.name}/iteration_{iteration - 1}/morgan_1024_predictions"
             tot_sampling = train_sz   # only augment training; val/test are fixed
 
         body = textwrap.dedent(f"""\
@@ -440,7 +440,7 @@ class JobScriptFactory:
             # then perform the actual random sampling, deduplicate, and extract
             # both Morgan fingerprints and SMILES for the sampled molecules.
 
-            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
             mkdir -p "$ITER_DIR"
 
             # Step 1a: count molecules per file to reach target sample size
@@ -510,7 +510,7 @@ class JobScriptFactory:
             # Output: $ITER_DIR/sdf/<chunk>.sdf   (Gnina)
             #     or  $ITER_DIR/pdbqt/<chunk>/<molid>.pdbqt   (AutoDock-GPU)
 
-            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
 
             python "{self.pkg_dir}/dd_ligand_prep.py" \\
                 --smiles-dir "$ITER_DIR/smile" \\
@@ -546,7 +546,7 @@ class JobScriptFactory:
             # Outputs one SDF file per input set inside the "docked" folder.
             # The SDF must contain the docking score field used in Phase 4.
 
-            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
             mkdir -p "$ITER_DIR/docked"
 
         """) + docking_cmd + textwrap.dedent(f"""\
@@ -672,7 +672,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             # The DNN learns to predict docking scores from Morgan fingerprints,
             # enabling fast inference over the full library in Phase 5.
 
-            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
 
             # Step 4a: convert SDF docking scores -> binary label files
             python "{dd_dir}/scripts_2/extract_labels.py" \\
@@ -742,7 +742,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             # morgan_1024_predictions/ - this becomes the sampling pool for
             # the next iteration's Phase 1.
 
-            ITER_DIR="{self.proj}/iteration_{iteration:02d}"
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
 
             # Step 5a: generate one inference script per fingerprint chunk
             python "{dd_dir}/scripts_2/simple_job_predictions_manual.py" \\
@@ -790,7 +790,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             # This step maps those IDs back to SMILES so they can be prepared
             # for final explicit docking.
 
-            LAST_PRED="{self.proj}/iteration_{last_iteration:02d}/morgan_1024_predictions"
+            LAST_PRED="{self.proj}/{self.name}/iteration_{last_iteration}/morgan_1024_predictions"
 
             python "{dd_dir}/utilities/final_extraction.py" \\
                 -smile_dir "{smi_dir}" \\
