@@ -402,15 +402,34 @@ else
     # module, otherwise RDKit is installed from PyPI below.
     PY_MODULE=""; RDKIT_MODULE=""
     if type module &>/dev/null; then
-        info "Loading python + rdkit modules (gcc prerequisite)..."
-        module load gcc 2>/dev/null || true
+        info "Loading base modules + selecting a python module..."
+        # Load the resolved StdEnv/gcc/cuda(+engine) base from Step 6 so the
+        # rdkit probe sees the same toolchain the campaign will run under.
+        module load $DOCK_MODS 2>/dev/null || true
         module load python/3.11 2>/dev/null || module load python/3.10 2>/dev/null \
             || module load python 2>/dev/null || true
         PY_MODULE=$(module -t list 2>&1 | grep -iE '^python/' | head -1)
-        RDKIT_FULL=$(module spider rdkit 2>&1 | grep -oE "rdkit/[0-9][^ :]*" | head -1)
-        [ -n "$RDKIT_FULL" ] && module load "$RDKIT_FULL" 2>/dev/null
-        RDKIT_MODULE=$(module -t list 2>&1 | grep -iE '^rdkit/' | head -1)
-        [ -n "$RDKIT_MODULE" ] && success "RDKit will come from module: $RDKIT_MODULE"
+
+        # Meeko imports rdkit.Chem.rdDetermineBonds, which older Alliance rdkit
+        # builds (e.g. 2023.09.3) do not ship. Enumerate the available rdkit
+        # modules NEWEST-FIRST and pick the first that provides it.
+        # Each candidate is tested in its own login subshell.
+        info "Probing rdkit modules for rdDetermineBonds (Meeko needs it)..."
+        RDKIT_VERSIONS=$(module spider rdkit 2>&1 \
+            | grep -oE 'rdkit/[0-9][^ :]*' | sort -u -rV)
+        for rv in $RDKIT_VERSIONS; do
+            if bash -lc "module load $DOCK_MODS $PY_MODULE $rv >/dev/null 2>&1 && \
+                         python -c 'from rdkit.Chem import rdDetermineBonds' >/dev/null 2>&1"; then
+                RDKIT_MODULE="$rv"
+                break
+            fi
+        done
+        if [ -n "$RDKIT_MODULE" ]; then
+            module load "$RDKIT_MODULE" 2>/dev/null || true
+            success "RDKit module with rdDetermineBonds: $RDKIT_MODULE"
+        else
+            warn "No rdkit module provides rdDetermineBonds. RDKit will be installed from PyPI."
+        fi
     fi
     PYTHON=$(command -v python3 || command -v python || true)
     if [ -z "$PYTHON" ]; then
@@ -458,6 +477,14 @@ else
                     info "Installing Meeko (+gemmi) from PyPI..."
                     PIP_CONFIG_FILE=/dev/null pip install --no-deps gemmi meeko \
                         || warn "Meeko install failed - install it manually into the venv."
+                fi
+                # RDKit from PyPI only if no cluster module provided
+                # rdDetermineBonds above (otherwise RDKit stays the module).
+                if [ -z "${RDKIT_MODULE:-}" ] \
+                   && ! python -c "from rdkit.Chem import rdDetermineBonds" 2>/dev/null; then
+                    info "No suitable rdkit module found; installing RDKit from PyPI..."
+                    PIP_CONFIG_FILE=/dev/null pip install rdkit \
+                        || warn "RDKit install failed. Install it manually into the venv."
                 fi
             fi
             # Restore numpy aliases (np.bool, ...) that the DD code needs but
