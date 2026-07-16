@@ -10,9 +10,9 @@
 # What it does:
 #   * finds (or clones) the DD_protocol scripts
 #   * picks the docking engine (Gnina or AutoDock-GPU) and binding-site strategy
-#   * records the cluster modules that provide the docking tools
-#   * creates the conda/mamba software environment (from DD_protocol's
-#     environment.yml, plus Meeko) if you don't already have one
+#   * resolves the cluster modules that provide the docking tools
+#   * BUILDS the software environment: a conda env from dd_environment.yml, or
+#     (when conda isn't available) a pip virtualenv from dd_requirements.txt
 #   * collects the Deep Docking parameters (with explanations from the DD paper)
 #   * writes a ready-to-run campaign.yaml and validates it
 #
@@ -236,11 +236,9 @@ read -r ENGINE_CHOICE; ENGINE_CHOICE="${ENGINE_CHOICE:-1}"
 ADD=""
 if [ "$ENGINE_CHOICE" = "2" ]; then
     DOCK_PROGRAM="AUTODOCK_GPU"; SCORE_KEYWORD="ADGPU_score"
-    DEFAULT_MODULES="autodock-gpu autodock"
     ADD=1   # AutoDock-GPU also needs grid maps built by dd_receptor_prep
 else
     DOCK_PROGRAM="GNINA"; SCORE_KEYWORD="minimizedAffinity"
-    DEFAULT_MODULES="gnina"
 fi
 success "Engine: $DOCK_PROGRAM  (score field: $SCORE_KEYWORD)"
 
@@ -368,22 +366,33 @@ if [ -n "$PKG_MGR" ] && [ -f "$ENV_YML" ]; then
 else
     # -------------------- python virtualenv path --------------------
     [ -z "$PKG_MGR" ] && info "No conda/mamba found - building a Python virtualenv with pip."
-    # Load the modules the venv needs at build time here as well as at job run time.
-    #   python  - the venv symlinks to it
-    #   rdkit   - on Alliance, RDKit is a module, it must be
-    #             loaded before the venv is activated. gcc is its prerequisite.
-    # We capture the resolved names so they go into env.modules automatically.
+    # Load the python module the venv symlinks to (jobs must load the SAME one
+    # before activating). For RDKit, Meeko needs rdkit.Chem.rdDetermineBonds,
+    # which SOME Alliance rdkit builds omit - so probe the module versions
+    # (newest first) for one that actually provides it. If found we use that
+    # (cluster-optimized) module; otherwise RDKit is installed from PyPI below.
     PY_MODULE=""; RDKIT_MODULE=""
     if type module &>/dev/null; then
-        info "Loading python + rdkit modules (gcc prerequisite)..."
+        info "Loading a Python module..."
         module load gcc 2>/dev/null || true
         module load python/3.11 2>/dev/null || module load python/3.10 2>/dev/null \
             || module load python 2>/dev/null || true
         PY_MODULE=$(module -t list 2>&1 | grep -iE '^python/' | head -1)
-        RDKIT_FULL=$(module spider rdkit 2>&1 | grep -oE "rdkit/[0-9][^ :]*" | head -1)
-        [ -n "$RDKIT_FULL" ] && module load "$RDKIT_FULL" 2>/dev/null
-        RDKIT_MODULE=$(module -t list 2>&1 | grep -iE '^rdkit/' | head -1)
-        [ -n "$RDKIT_MODULE" ] && success "RDKit will come from module: $RDKIT_MODULE"
+        info "Looking for an rdkit module that includes rdDetermineBonds..."
+        # Test each version in an ISOLATED login shell so a version that swaps the
+        # python/StdEnv stack can't poison later tests. Newest first.
+        for _v in $(module spider rdkit 2>&1 | grep -oE "rdkit/[0-9][^ :]*" | sort -rV); do
+            if bash -lc "module load StdEnv/2023 gcc/12.3 ${PY_MODULE:-python} $_v >/dev/null 2>&1 \
+                         && python -c 'from rdkit.Chem import rdDetermineBonds'" 2>/dev/null; then
+                RDKIT_MODULE="$_v"; break
+            fi
+        done
+        if [ -n "$RDKIT_MODULE" ]; then
+            module load "$RDKIT_MODULE" 2>/dev/null || true
+            success "RDKit will come from module: $RDKIT_MODULE (has rdDetermineBonds)"
+        else
+            warn "No rdkit module provides rdDetermineBonds; RDKit will come from PyPI."
+        fi
     fi
     PYTHON=$(command -v python3 || command -v python || true)
     if [ -z "$PYTHON" ]; then
@@ -424,8 +433,16 @@ else
                 info "Installing core packages from dd_requirements.txt (~5-15 min)..."
                 pip install --upgrade pip >/dev/null 2>&1 || true
                 pip install -r "$REQ_TXT"
-                # Meeko + gemmi from PyPI, with --no-deps.
+                # Meeko + gemmi from PyPI (PIP_CONFIG_FILE=/dev/null clears the
+                # wheelhouse-only config). RDKit is installed from PyPI ONLY if no
+                # module version provided rdDetermineBonds above; otherwise RDKit
+                # stays the cluster module and we must NOT shadow it with a wheel.
                 if ! python -c "import meeko" 2>/dev/null; then
+                    if [ -z "${RDKIT_MODULE:-}" ] && ! python -c "import rdkit" 2>/dev/null; then
+                        info "Installing RDKit from PyPI..."
+                        PIP_CONFIG_FILE=/dev/null pip install rdkit \
+                            || warn "RDKit (PyPI) install failed."
+                    fi
                     info "Installing Meeko (+gemmi) from PyPI..."
                     PIP_CONFIG_FILE=/dev/null pip install --no-deps gemmi meeko \
                         || warn "Meeko install failed - install it manually into the venv."
@@ -436,7 +453,7 @@ else
             _install_numpy_shim
             python -c "$REQUIRED_IMPORTS" 2>/dev/null \
                 && success "Virtualenv ready and verified: $VENV_DIR" \
-                || warn "Some imports still fail. Check the log above (rdkit must come from its module)."
+                || warn "Some imports still fail - check the log above."
             deactivate 2>/dev/null || true
         else
             error "Failed to create virtualenv at $VENV_DIR."
@@ -487,8 +504,10 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 # Finalize env.modules: the docking chain from Step 6, plus (for a venv) the
-# python and rdkit modules, which load before the venv activates. Order
-# preserved.
+# python module and - if one with rdDetermineBonds was found - the rdkit module,
+# which must load before the venv activates. If no rdkit module qualified,
+# RDKit came from PyPI and is not listed here. Order preserved: insert the extra
+# modules just before the engine module (the last one).
 FINAL_MODS=("${MODULE_ARR[@]}")
 if [[ "$ENV_ACTIVATE" == *bin/activate* ]]; then
     EXTRA_MODS=()
@@ -550,8 +569,12 @@ dd:
 scheduler:
   type: "SLURM"
   account: "$SLURM_ACCOUNT"
-  cpu_partition: "cpu"
-  gpu_partition: "gpu"
+  # Partition/queue is optional. Leave blank (as here) on clusters that
+  # schedule from the account alone -- e.g. the Digital Research Alliance of
+  # Canada, which rejects an explicit partition. On a partitioned cluster,
+  # fill in the queue names (e.g. "cpu" / "gpu").
+  cpu_partition: ""
+  gpu_partition: ""
 
   walltime:
     phase1_sampling: "00:30:00"
@@ -606,7 +629,11 @@ echo "  Account       : $SLURM_ACCOUNT"
 echo "  Engine        : $DOCK_PROGRAM"
 echo "  Site strategy : $SITE_METHOD"
 echo "  Modules       : $MODULES_YAML"
-echo "  Conda env     : $CONDA_ENV"
+if [ -n "$CONDA_ENV" ]; then
+    echo "  Conda env     : $CONDA_ENV"
+else
+    echo "  Env activate  : $ENV_ACTIVATE"
+fi
 echo "  DD protocol   : $DD_PROTOCOL_DIR"
 echo "  Config        : $CONFIG_FILE"
 echo ""
