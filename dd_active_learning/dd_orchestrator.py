@@ -223,10 +223,15 @@ class Scheduler:
 
     def header(self, job_name: str, walltime: str, nodes: int,
                cpus: int, mem: str, gpus: int, account: str,
-               partition: str, log_dir: str) -> str:
+               partition: str, log_dir: str, gpu_type: str = "") -> str:
         """Return the scheduler-specific resource header for a job script."""
+        # GPU type is required on some clusters (e.g. Alliance rejects a bare gpu request
+        # and demand a model, so --gres=gpu:h100:1 rather than --gres=gpu:1).
+        # When gpu_type is set, name the model; when blank, request by count.
+        gtype = (gpu_type or "").strip()
+        slurm_gres = f"gpu:{gtype}:{gpus}" if gtype else f"gpu:{gpus}"
         gpu_lines = {
-            "SLURM": f"#SBATCH --gres=gpu:{gpus}",
+            "SLURM": f"#SBATCH --gres={slurm_gres}",
             "PBS":   f"#PBS -l ngpus={gpus}",
             "SGE":   f"#$ -l gpu={gpus}",
         }
@@ -398,9 +403,10 @@ class JobScriptFactory:
         wt  = self.cfg["scheduler"]["walltime"][phase_key]
         acc = self.cfg["scheduler"]["account"]
         par = self.cfg["scheduler"].get(partition_key, "")   # optional; blank = omit
+        gtype = self.cfg["scheduler"].get("gpu_type", "")    # optional; blank = omit model
         log = f"{self.proj}/logs"
         return self.s.header(job_name, wt, r["nodes"], r["cpus"],
-                             r["mem"], r["gpus"], acc, par, log)
+                             r["mem"], r["gpus"], acc, par, log, gtype)
 
     # ------------------------------------------------------------------
     # Phase 1: Random sampling from library (iter 1) or predictions (iter N>1)
@@ -813,6 +819,7 @@ class DDOrchestrator:
     def __init__(self, cfg: dict, dry_run: bool = False):
         self.cfg        = cfg
         self.proj       = cfg["project_dir"]
+        self.dry_run    = dry_run
         self.total_iter = cfg["dd"]["total_iterations"]
         self.scheduler  = Scheduler(cfg["scheduler"]["type"],
                                     cfg["scheduler"]["account"],
@@ -847,7 +854,11 @@ class DDOrchestrator:
             return existing
 
         job_id = self.scheduler.submit(path, depends_on)
-        self.state.record_job(iteration, phase, job_id)
+        # Never persist dry-run job IDs: a later real run would
+        # see the phase as already submitted and reuse the fake ID as a real
+        # scheduler dependency, which the scheduler rejects.
+        if not self.dry_run:
+            self.state.record_job(iteration, phase, job_id)
         return job_id
 
     def run(self, start_iter: int = 1, start_phase: int = 1):
@@ -899,8 +910,9 @@ class DDOrchestrator:
         final_script = self.factory.final_extraction(self.total_iter)
         final_path   = self._write_script("final_extraction", final_script)
         final_id     = self.scheduler.submit(final_path, last_job_id)
-        self.state.data["final_extraction_job_id"] = final_id
-        self.state.save()
+        if not self.dry_run:
+            self.state.data["final_extraction_job_id"] = final_id
+            self.state.save()
 
         print(f"\n{'='*60}")
         print(f"  All jobs submitted. Final job ID: {final_id}")

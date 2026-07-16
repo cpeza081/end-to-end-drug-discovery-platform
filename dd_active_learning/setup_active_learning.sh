@@ -137,6 +137,34 @@ fi
 success "Using account: $SLURM_ACCOUNT"
 
 # =============================================================================
+# Step 1b: GPU model (required on newer Alliance clusters)
+# =============================================================================
+info "Detecting the GPU model available on this cluster..."
+GPU_TYPE=""
+if command -v sinfo &>/dev/null; then
+    # gres strings look like "gpu:h100:4" or "gpu:a100:4(S:0-1)". Pull the model
+    # (the token between the two colons), drop count-only forms, pick the most
+    # common one across partitions.
+    GPU_TYPE=$(sinfo -h -o '%G' 2>/dev/null \
+        | tr ',' '\n' \
+        | grep -oE 'gpu:[A-Za-z][A-Za-z0-9_.]*:' \
+        | sed -E 's/^gpu:(.*):$/\1/' \
+        | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+fi
+if [ -n "$GPU_TYPE" ]; then
+    prompt_default "GPU model to request (blank = untyped)" "$GPU_TYPE"
+else
+    note "Could not auto-detect a GPU model. Common Alliance value: h100 (Nibi/Fir/Rorqual). Leave blank if your cluster accepts an untyped GPU request (Fir does not)."
+    prompt_default "GPU model to request (blank = untyped)" ""
+fi
+GPU_TYPE="$REPLY_VAL"
+if [ -n "$GPU_TYPE" ]; then
+    success "Requesting GPUs as: gpu:$GPU_TYPE:<n>"
+else
+    success "Requesting untyped GPUs: gpu:<n>"
+fi
+
+# =============================================================================
 # Step 2: Prepared library (link a finished dd_prep run)
 # =============================================================================
 ask "How will the prepared library be provided?"
@@ -555,6 +583,9 @@ scheduler:
   account: "$SLURM_ACCOUNT"
   cpu_partition: ""
   gpu_partition: ""
+  # GPU model. Required on newer Alliance clusters (Nibi/Fir/Rorqual -> h100). Leave blank where an untyped GPU
+  # request is accepted. Emits --gres=gpu:<gpu_type>:<n> when set.
+  gpu_type: "$GPU_TYPE"
 
   walltime:
     phase1_sampling: "00:30:00"

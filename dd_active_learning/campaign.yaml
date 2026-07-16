@@ -79,6 +79,13 @@ scheduler:
   cpu_partition: ""         # Partition/queue for CPU jobs (sampling, ligand prep)
   gpu_partition: ""         # Partition/queue for GPU jobs (docking, training, inference)
 
+  # GPU model. Required on Alliance. Set to the model your cluster offers. Leave blank on clusters that
+  # accept an untyped GPU request.
+  #   Nibi / Fir / Rorqual -> "h100"    Narval -> "a100"
+  #   Beluga / Graham       -> "v100"   (check: `sinfo -o "%G"` or the docs)
+  # Produces  --gres=gpu:<gpu_type>:<n>  (or --gres=gpu:<n> when blank).
+  gpu_type: ""
+
   # Walltime limits per phase. Adjust this based on your system and library size
   walltime:
     phase1_sampling: "00:30:00"
