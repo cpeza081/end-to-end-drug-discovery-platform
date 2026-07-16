@@ -947,6 +947,25 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
 # Orchestrator
 # =============================================================================
 
+# Aggregation priority for collapsing many task states into one: an incomplete/bad task dominates,
+# so a phase only counts as COMPLETED when every row is COMPLETED.
+_STATE_PRIORITY = [
+    "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE",
+    "CANCELLED", "REVOKED", "PREEMPTED", "SUSPENDED",
+    "RUNNING", "REQUEUED", "PENDING", "COMPLETED",
+]
+
+
+def _aggregate_states(states: list[str]) -> str:
+    norm = [s.split("+")[0].strip().upper() for s in states if s.strip()]
+    if not norm:
+        return "MISSING"
+    for st in _STATE_PRIORITY:
+        if st in norm:
+            return st
+    return norm[0]
+
+
 class DDOrchestrator:
     """
     Builds and submits the full DD active-learning chain.
@@ -1015,25 +1034,106 @@ class DDOrchestrator:
             return 0
 
     def _submit_phase5(self, iteration: int, depends_on: str | None,
-                       n_chunks: int, throttle: int) -> str:
+                       n_chunks: int, throttle: int, resume: bool = False) -> str:
         """Submit Phase 5 as two chained jobs. 5a generates one inference script
         per fingerprint chunk, and 5b runs them as a job array (1-N%throttle).
-        Returns the array job ID (the dependency for whatever runs next)."""
+        Returns the array job ID (the dependency for whatever runs next).
+
+        In resume mode, if 5a is already COMPLETED (kept in state, skipped here)
+        its job may be purged, so 5b must not afterok-depend on it; the
+        generated scripts are already on disk, so 5b depends on nothing."""
         print(f"  Phase 5: Inference  (generate + array over {n_chunks} chunks, "
               f"<= {throttle} concurrent tasks)")
+        a_already = self.state.is_phase_submitted(iteration, "5a")
         gen_script = self.factory.phase5a_generate(iteration)
         gen_id = self._submit_phase(iteration, "5a", gen_script, depends_on)
 
+        # 5b depends on 5a only if 5a was actually (re)submitted this run.
+        b_dep = None if (resume and a_already) else gen_id
         arr_script = self.factory.phase5b_array(iteration)
         array_spec = f"1-{n_chunks}%{throttle}"
-        return self._submit_phase(iteration, "5b", arr_script, gen_id,
+        return self._submit_phase(iteration, "5b", arr_script, b_dep,
                                   array=array_spec)
 
-    def run(self, start_iter: int = 1, start_phase: int = 1):
+    def _actual_state(self, job_id: str | None) -> str:
+        """Query the scheduler for a job's aggregated final state (array-aware).
+        Returns COMPLETED / CANCELLED / FAILED / ... or MISSING/UNKNOWN."""
+        if not job_id:
+            return "MISSING"
+        stype = self.cfg["scheduler"]["type"]
+        try:
+            if stype == "SLURM":
+                r = subprocess.run(
+                    ["sacct", "-j", str(job_id), "--format=State",
+                     "--noheader", "-P"],
+                    capture_output=True, text=True, timeout=30)
+                states = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+                return _aggregate_states(states)
+            # PBS/SGE: no reliable historical lookup here so we treat as UNKNOWN so
+            # the phase is resubmitted (re-running a done phase overwrites its
+            # outputs, so this is safe if occasionally redundant).
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return "UNKNOWN"
+        return "UNKNOWN"
+
+    def _prepare_resume(self) -> tuple[int, int] | None:
+        """For --resume: find the first phase whose real scheduler state is not
+        COMPLETED, delete it (and everything after it) from the state ledger so
+        it will be resubmitted, and return (start_iter, start_phase).  Completed
+        phases are kept and never re-run.  Returns None if nothing needs redoing.
+        """
+        order: list[tuple] = []
+        for it in range(1, self.total_iter + 1):
+            for ph in (1, 2, 3, 4, "5a", "5b"):
+                order.append((it, ph))
+        order.append(("final", "final"))
+
+        resume_idx = None
+        for idx, (it, ph) in enumerate(order):
+            if ph == "final":
+                jid = self.state.data.get("final_extraction_job_id")
+            else:
+                jid = self.state.get_job_id(it, ph)
+            st = self._actual_state(jid)
+            if st != "COMPLETED":
+                resume_idx = idx
+                where = "final extraction" if ph == "final" else f"iter {it} phase {ph}"
+                shown = st if jid else "not submitted"
+                print(f"  Resume point: {where}  (state: {shown})")
+                break
+
+        if resume_idx is None:
+            return None
+
+        # Clear the resume step and everything after it from the ledger.
+        for it, ph in order[resume_idx:]:
+            if ph == "final":
+                self.state.data.pop("final_extraction_job_id", None)
+            else:
+                itd = self.state.data["iterations"].get(str(it))
+                if itd:
+                    itd.pop(f"phase{ph}_job_id", None)
+                    itd.pop(f"phase{ph}_submitted", None)
+        self.state.save()
+
+        it, ph = order[resume_idx]
+        if ph == "final":
+            return (self.total_iter + 1, 1)     # loop is empty; only final runs
+        if ph in ("5a", "5b"):
+            return (it, 5)
+        return (it, ph)
+
+    def run(self, start_iter: int = 1, start_phase: int = 1,
+            resume: bool = False):
         """
         Submit the full DD campaign.
         Each iteration submits phases 1-5 in a dependency chain.
         The final extraction is submitted after the last iteration's phase 5.
+
+        resume=True inspects the scheduler for each recorded phase's actual
+        state, keeps the COMPLETED ones, and resubmits from the first incomplete
+        phase with a fresh dependency chain (so it never depends on a cancelled
+        or purged job).
         """
         print(f"\n{'='*60}")
         print(f"  Deep Docking Campaign: {self.cfg['campaign_name']}")
@@ -1043,8 +1143,22 @@ class DDOrchestrator:
         print(f"{'='*60}\n")
 
         last_job_id = None
+        resume_mode = False
 
-        if start_iter > 1 or start_phase > 1:
+        if resume:
+            print("Resume: checking actual scheduler state of each phase...")
+            rp = self._prepare_resume()
+            if rp is None:
+                print("Nothing to resume. Every recorded phase already "
+                      "COMPLETED (campaign finished).\n")
+                return
+            start_iter, start_phase = rp
+            resume_mode = True
+            # Deliberately DO NOT chain onto prior (completed) jobs: their inputs
+            # are already on disk, and afterok on a purged job id fails.
+            print(f"Resuming from iteration {start_iter}, phase {start_phase} "
+                  f"(completed phases kept; fresh dependency chain).\n")
+        elif start_iter > 1 or start_phase > 1:
             last_job_id = self._find_resume_job_id(start_iter, start_phase)
             print(f"Resuming from iteration {start_iter}, phase {start_phase}")
             print(f"Chaining from job ID: {last_job_id}\n")
@@ -1102,18 +1216,23 @@ class DDOrchestrator:
             # Phase 5: generate inference scripts + run them as a job array.
             if phase_start <= 5:
                 last_job_id = self._submit_phase5(
-                    iteration, last_job_id, n_chunks, throttle
+                    iteration, last_job_id, n_chunks, throttle, resume=resume_mode
                 )
             print()
 
-        # Final extraction - depends on the last iteration's phase 5
+        # Final extraction, depends on the last iteration's phase 5.
         print("-- Final extraction -------------------------------")
-        final_script = self.factory.final_extraction(self.total_iter)
-        final_path   = self._write_script("final_extraction", final_script)
-        final_id     = self.scheduler.submit(final_path, last_job_id)
-        if not self.dry_run:
-            self.state.data["final_extraction_job_id"] = final_id
-            self.state.save()
+        if resume_mode and self.state.data.get("final_extraction_job_id"):
+            final_id = self.state.data["final_extraction_job_id"]
+            print(f"  [done] final extraction already COMPLETED "
+                  f"(job {final_id}) - keeping.")
+        else:
+            final_script = self.factory.final_extraction(self.total_iter)
+            final_path   = self._write_script("final_extraction", final_script)
+            final_id     = self.scheduler.submit(final_path, last_job_id)
+            if not self.dry_run:
+                self.state.data["final_extraction_job_id"] = final_id
+                self.state.save()
 
         print(f"\n{'='*60}")
         print(f"  All jobs submitted. Final job ID: {final_id}")
@@ -1174,11 +1293,17 @@ def main():
                         help="Phase within start-iter to start from (default: 1)")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Write job scripts but do not submit them")
+    parser.add_argument("--resume",      action="store_true",
+                        help="Resume after cancellation: query the scheduler for "
+                             "each phase's real state, keep the COMPLETED ones, "
+                             "and resubmit from the first incomplete phase with a "
+                             "fresh dependency chain. Overrides --start-iter/-phase.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     orchestrator = DDOrchestrator(cfg, dry_run=args.dry_run)
-    orchestrator.run(start_iter=args.start_iter, start_phase=args.start_phase)
+    orchestrator.run(start_iter=args.start_iter, start_phase=args.start_phase,
+                     resume=args.resume)
 
 
 if __name__ == "__main__":
