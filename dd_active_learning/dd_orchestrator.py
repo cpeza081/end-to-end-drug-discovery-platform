@@ -232,45 +232,52 @@ class Scheduler:
         }
         gpu_line = (gpu_lines[self.stype] + "\n") if gpus > 0 else ""
 
+        # Partition/queue is optional: many clusters reject an explicit partition and schedule from the
+        # account alone.  When the config leaves it blank, omit the directive.
+        part = (partition or "").strip()
+        part_lines = {
+            "SLURM": f"#SBATCH --partition={part}",
+            "PBS":   f"#PBS -q {part}",
+            "SGE":   f"#$ -q {part}",
+        }
+        part_line = (part_lines[self.stype] + "\n") if part else ""
+
         if self.stype == "SLURM":
             return textwrap.dedent(f"""\
                 #!/bin/bash
                 #SBATCH --job-name={job_name}
                 #SBATCH --account={account}
-                #SBATCH --partition={partition}
                 #SBATCH --nodes={nodes}
                 #SBATCH --cpus-per-task={cpus}
                 #SBATCH --mem={mem}
                 #SBATCH --time={walltime}
                 #SBATCH --output={log_dir}/{job_name}_%j.out
                 #SBATCH --error={log_dir}/{job_name}_%j.err
-                {gpu_line}""")
+                {part_line}{gpu_line}""")
 
         if self.stype == "PBS":
             return textwrap.dedent(f"""\
                 #!/bin/bash
                 #PBS -N {job_name}
                 #PBS -A {account}
-                #PBS -q {partition}
                 #PBS -l nodes={nodes}:ppn={cpus}
                 #PBS -l mem={mem}
                 #PBS -l walltime={walltime}
                 #PBS -o {log_dir}/{job_name}.out
                 #PBS -e {log_dir}/{job_name}.err
-                {gpu_line}""")
+                {part_line}{gpu_line}""")
 
         # SGE
         return textwrap.dedent(f"""\
             #!/bin/bash
             #$ -N {job_name}
             #$ -A {account}
-            #$ -q {partition}
             #$ -pe smp {cpus}
             #$ -l h_vmem={mem}
             #$ -l h_rt={walltime}
             #$ -o {log_dir}/{job_name}.out
             #$ -e {log_dir}/{job_name}.err
-            {gpu_line}""")
+            {part_line}{gpu_line}""")
 
 
 # =============================================================================
@@ -390,7 +397,7 @@ class JobScriptFactory:
         r   = self.cfg["scheduler"]["resources"][phase_key]
         wt  = self.cfg["scheduler"]["walltime"][phase_key]
         acc = self.cfg["scheduler"]["account"]
-        par = self.cfg["scheduler"][partition_key]
+        par = self.cfg["scheduler"].get(partition_key, "")   # optional; blank = omit
         log = f"{self.proj}/logs"
         return self.s.header(job_name, wt, r["nodes"], r["cpus"],
                              r["mem"], r["gpus"], acc, par, log)

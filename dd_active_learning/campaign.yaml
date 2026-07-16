@@ -73,8 +73,11 @@ dd:
 scheduler:
   type: "SLURM"             # "SLURM", "PBS", or "SGE"  (PBS/SGE = limited support)
   account: "rrg-checco89"   # Billing account (SLURM: --account; PBS: -A)
-  cpu_partition: "cpu"      # Partition/queue for CPU jobs (sampling, ligand prep)
-  gpu_partition: "gpu"      # Partition/queue for GPU jobs (docking, training, inference)
+  # Partition/queue is optional. Leave blank on clusters that schedule from the
+  # account alone (e.g. the Digital Research Alliance of Canada, which rejects an
+  # explicit --partition). On a partitioned cluster, set the queue names.
+  cpu_partition: ""         # Partition/queue for CPU jobs (sampling, ligand prep)
+  gpu_partition: ""         # Partition/queue for GPU jobs (docking, training, inference)
 
   # Walltime limits per phase. Adjust this based on your system and library size
   walltime:
