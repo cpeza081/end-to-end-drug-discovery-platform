@@ -86,6 +86,12 @@ scheduler:
   # Produces  --gres=gpu:<gpu_type>:<n>  (or --gres=gpu:<n> when blank).
   gpu_type: ""
 
+  # Nodes to keep jobs off of (SLURM --exclude), e.g. GPUs staff flagged as faulty.
+  # Comma/range list, blank to exclude none. Example: "fc10101,fc10102" or
+  # "fc[10101-10105]".  GPU jobs also self-check with nvidia-smi and fail
+  # naming the node if they land on a bad GPU.
+  exclude_nodes: ""
+
   # Phase 5 (library-wide inference) runs as a SLURM job ARRAY with one task per
   # fingerprint chunk so it scales to billion-size libraries. array_throttle
   # caps how many tasks run at once (each uses one GPU slice). Raise it if your

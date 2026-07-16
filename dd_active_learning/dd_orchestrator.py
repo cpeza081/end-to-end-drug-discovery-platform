@@ -236,11 +236,12 @@ class Scheduler:
     def header(self, job_name: str, walltime: str, nodes: int,
                cpus: int, mem: str, gpus: int, account: str,
                partition: str, log_dir: str, gpu_type: str = "",
-               array_log: bool = False) -> str:
+               array_log: bool = False, exclude: str = "") -> str:
         """Return the scheduler-specific resource header for a job script.
 
         When array_log is True, SLURM output/error filenames use %A_%a
         (array-job id + task id) so each array task logs to its own file.
+        `exclude` (e.g. "fc10101,fc10102") keeps jobs off known-bad nodes.
         """
         # SLURM log tag: per-array-task file for arrays, per-job file otherwise.
         slurm_tag = "%A_%a" if array_log else "%j"
@@ -266,6 +267,15 @@ class Scheduler:
         }
         part_line = (part_lines[self.stype] + "\n") if part else ""
 
+        # Optional node exclusion.
+        excl = (exclude or "").strip()
+        excl_lines = {
+            "SLURM": f"#SBATCH --exclude={excl}",
+            "PBS":   "",   # PBS/SGE node exclusion is site-specific. skip.
+            "SGE":   "",
+        }
+        excl_line = (excl_lines[self.stype] + "\n") if (excl and excl_lines[self.stype]) else ""
+
         if self.stype == "SLURM":
             return textwrap.dedent(f"""\
                 #!/bin/bash
@@ -277,7 +287,7 @@ class Scheduler:
                 #SBATCH --time={walltime}
                 #SBATCH --output={log_dir}/{job_name}_{slurm_tag}.out
                 #SBATCH --error={log_dir}/{job_name}_{slurm_tag}.err
-                {part_line}{gpu_line}""")
+                {part_line}{gpu_line}{excl_line}""")
 
         if self.stype == "PBS":
             return textwrap.dedent(f"""\
@@ -360,7 +370,7 @@ class JobScriptFactory:
     # ------------------------------------------------------------------
     # Shared preamble written at the top of every script
     # ------------------------------------------------------------------
-    def _preamble(self, iteration: int) -> str:
+    def _preamble(self, iteration: int, gpu: bool = False) -> str:
         dd_dir = self.cfg["env"]["dd_protocol_dir"]
 
         # How to activate the Python environment inside each job.  The wizard
@@ -414,6 +424,7 @@ class JobScriptFactory:
 
             set -u    # environment is up; now also catch unset variables
 
+            __DD_GPUCHECK__
             # nullglob: an unmatched glob expands to nothing, so `for f in dir/*.smi`
             # never feeds a bogus "dir/*.smi" path into a tool.  Loops that require
             # input guard against emptiness (below).
@@ -421,7 +432,26 @@ class JobScriptFactory:
 
             echo "[$(date)] Starting iteration ${{DD_ITERATION}}"
         """)
-        return preamble.replace("__DD_MODULES__\n", module_block)
+
+        # GPU health check: Fail fast and name the node so this job does
+        # not run docking/training/inference on a bad device. The node can then
+        # be excluded (scheduler.exclude_nodes or sbatch --exclude).
+        gpu_block = ""
+        if gpu:
+            gpu_block = textwrap.dedent("""\
+                if command -v nvidia-smi &>/dev/null; then
+                    if ! nvidia-smi >/dev/null 2>&1; then
+                        echo "ERROR: nvidia-smi failed on $(hostname). GPU likely faulty (needs reset). Resubmit excluding this node: add it to scheduler.exclude_nodes in campaign.yaml, or use sbatch --exclude=$(hostname)." >&2
+                        exit 1
+                    fi
+                    echo "[$(date)] GPU healthy on $(hostname):"
+                    nvidia-smi -L || true
+                fi
+                """)
+
+        return (preamble
+                .replace("__DD_MODULES__\n", module_block)
+                .replace("__DD_GPUCHECK__\n", gpu_block))
 
     # Fallbacks for phase keys a config does not define.
     _DEFAULT_RES = {"nodes": 1, "cpus": 2, "mem": "8G", "gpus": 0}
@@ -441,10 +471,11 @@ class JobScriptFactory:
         acc = sched["account"]
         par = sched.get(partition_key, "")     # optional. blank = omit
         gtype = sched.get("gpu_type", "")      # optional. blank = omit model
+        excl = sched.get("exclude_nodes", "")  # optional. blank = exclude none
         log = f"{self.proj}/logs"
         return self.s.header(job_name, wt, r["nodes"], r["cpus"],
                              r["mem"], r["gpus"], acc, par, log, gtype,
-                             array_log)
+                             array_log, excl)
 
     # Phase 1 (sampling) is one job that reads/samples every fingerprint chunk,
     # so its walltime should grow with the number of chunks.
@@ -634,7 +665,7 @@ class JobScriptFactory:
             echo "[$(date)] Phase 3 complete - iteration {iteration}"
         """)
 
-        return header + self._preamble(iteration) + body
+        return header + self._preamble(iteration, gpu=True) + body
 
     def _gnina_docking_cmd(self, dock: dict) -> str:
         """Gnina docking: one multi-molecule SDF per chunk, into the explicit
@@ -799,7 +830,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             cat "$ITER_DIR/best_model_stats.txt" 2>/dev/null || true
         """)
 
-        return header + self._preamble(iteration) + body
+        return header + self._preamble(iteration, gpu=True) + body
 
     # ------------------------------------------------------------------
     # Phase 5: Inference over the full library (5a generate, 5b array)
@@ -876,7 +907,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             echo "[$(date)] Phase 5b task $TID complete"
         """)
 
-        return header + self._preamble(iteration) + body
+        return header + self._preamble(iteration, gpu=True) + body
 
     # ------------------------------------------------------------------
     # Final phase: extract SMILES of surviving virtual hits for final docking

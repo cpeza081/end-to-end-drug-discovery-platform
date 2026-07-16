@@ -614,6 +614,10 @@ scheduler:
   # request is accepted. Emits --gres=gpu:<gpu_type>:<n> when set.
   gpu_type: "$GPU_TYPE"
 
+  # Nodes to keep jobs off (SLURM --exclude), e.g. GPUs flagged faulty by staff.
+  # Blank = exclude none. Example: "fc10101,fc10102" or "fc[10101-10105]".
+  exclude_nodes: ""
+
   # Phase 5 (library-wide inference) runs as a Slurm job array (one task per
   # fingerprint chunk). array_throttle
   # caps concurrent tasks (each uses one GPU slice).
