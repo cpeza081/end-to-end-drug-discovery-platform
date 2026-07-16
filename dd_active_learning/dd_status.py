@@ -43,17 +43,40 @@ STATUS_SYMBOLS = {
 }
 
 
+# Aggregation priority: a single "bad" or in-progress task should dominate the
+# summary.  Used to collapse a job array's many task states into one label.
+_STATE_PRIORITY = [
+    "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE",
+    "CANCELLED", "REVOKED", "PREEMPTED", "SUSPENDED",
+    "RUNNING", "REQUEUED", "PENDING", "COMPLETED",
+]
+
+
+def _aggregate_states(states: list[str]) -> str:
+    """Collapse many sacct State rows into one summary label by priority."""
+    norm = [s.split("+")[0].strip().upper() for s in states if s.strip()]
+    if not norm:
+        return "UNKNOWN"
+    for st in _STATE_PRIORITY:
+        if st in norm:
+            return st
+    return norm[0]
+
+
 def query_job_status(job_id: str, sched_type: str) -> str:
-    """Ask the scheduler for the current state of a job ID."""
+    """Ask the scheduler for the current state of a job ID.
+
+    For SLURM job arrays this aggregates across all task states.
+    """
     try:
         if sched_type == "SLURM":
             result = subprocess.run(
                 ["sacct", "-j", job_id, "--format=State", "--noheader", "-P"],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=15
             )
             lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
             if lines:
-                return lines[0].split("+")[0].upper()
+                return _aggregate_states(lines)
 
         elif sched_type == "PBS":
             result = subprocess.run(
@@ -98,9 +121,14 @@ def count_molecules(path: str) -> int | None:
     return total if total > 0 else None
 
 
-def read_best_model_stats(project_dir: str, iteration: int) -> dict:
-    """Parse the best_model_stats.txt file for an iteration."""
-    stats_path = (Path(project_dir) / f"iteration_{iteration:02d}"
+def read_best_model_stats(dd_root: str, iteration: int) -> dict:
+    """Parse the best_model_stats.txt file for an iteration.
+
+    dd_root is the DD project working directory ({project_dir}/{campaign_name}),
+    and iterations are unpadded (iteration_1, not iteration_01) to match
+    DD_protocol's layout.
+    """
+    stats_path = (Path(dd_root) / f"iteration_{iteration}"
                   / "best_model_stats.txt")
     result = {}
     if not stats_path.exists():
@@ -126,6 +154,9 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
     total_iter = cfg["dd"]["total_iterations"]
     sched_type = cfg["scheduler"]["type"]
     campaign = cfg["campaign_name"]
+    # DD_protocol writes under {project_dir}/{campaign_name}/iteration_{n}
+    # (unpadded). 
+    dd_root = f"{proj}/{campaign}"
     iters = state.get("iterations", {})
 
     print(f"\n{'='*65}")
@@ -141,23 +172,29 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
             continue
 
         # Check how many molecules survived inference (if done)
-        pred_dir = (Path(proj) / f"iteration_{it:02d}"
+        pred_dir = (Path(dd_root) / f"iteration_{it}"
                     / "morgan_1024_predictions")
         n_remaining = count_molecules(str(pred_dir))
 
         # Model performance stats
-        stats = read_best_model_stats(proj, it)
+        stats = read_best_model_stats(dd_root, it)
 
         print(f"\n  Iteration {it:2d}")
         print(f"  {'-'*55}")
 
-        for phase_num in range(1, 6):
-            job_id = it_data.get(f"phase{phase_num}_job_id")
-            submitted = it_data.get(f"phase{phase_num}_submitted", "")
-            phase_name = PHASE_NAMES[phase_num]
+        # Phases 1-4 are single jobs. Phase 5 is two steps: 5a (generate the
+        # inference scripts) and 5b (the inference job array).
+        phase_rows = [(str(p), PHASE_NAMES[p], f"phase{p}_job_id")
+                      for p in (1, 2, 3, 4)]
+        phase_rows.append(("5a", "Pred-gen",  "phase5a_job_id"))
+        phase_rows.append(("5b", "Inference", "phase5b_job_id"))
+
+        for label, phase_name, key in phase_rows:
+            job_id = it_data.get(key)
+            submitted = it_data.get(key.replace("_job_id", "_submitted"), "")
 
             if not job_id:
-                print(f"    Phase {phase_num} ({phase_name:<12})  "
+                print(f"    Phase {label:<3} ({phase_name:<12})  "
                       f"[not submitted]")
                 continue
 
@@ -168,8 +205,8 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
 
             symbol = STATUS_SYMBOLS.get(raw_status, "[??]  ")
             ts = submitted[:16] if submitted else ""
-            print(f"    Phase {phase_num} ({phase_name:<12})  "
-                  f"{symbol} {raw_status:<10}  job={job_id:<12}  {ts}")
+            print(f"    Phase {label:<3} ({phase_name:<12})  "
+                  f"{symbol} {raw_status:<10}  job={job_id:<14}  {ts}")
 
         if stats:
             print(f"\n    Model performance:")

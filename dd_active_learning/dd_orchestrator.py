@@ -132,14 +132,18 @@ class Scheduler:
             raise ValueError(f"Unsupported scheduler: {stype}. "
                              f"Choose from: SLURM, PBS, SGE")
 
-    def submit(self, script_path: str, depends_on: str | None = None) -> str:
+    def submit(self, script_path: str, depends_on: str | None = None,
+               array: str | None = None) -> str:
         """Submit a script, optionally depending on a previous job ID.
         Returns the new job ID string.
+
+        `array` (e.g. "1-500%20") submits a job array. The returned ID is the
+        array's job ID, and an afterok dependency on it waits for every task.
 
         Raises RuntimeError (with the scheduler's own stderr) on any
         submission failure or timeout.
         """
-        cmd = self._build_submit_cmd(script_path, depends_on) # Build the appropriate submission command based on scheduler type.
+        cmd = self._build_submit_cmd(script_path, depends_on, array) # Build the appropriate submission command based on scheduler type.
         print(f"  Submitting: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -172,21 +176,27 @@ class Scheduler:
         print(f"  -> Job ID: {job_id}")
         return job_id
 
-    def _build_submit_cmd(self, script: str, depends_on: str | None) -> list[str]:
-        """Construct the appropriate submission command based on the scheduler type and dependency."""
+    def _build_submit_cmd(self, script: str, depends_on: str | None,
+                          array: str | None = None) -> list[str]:
+        """Construct the appropriate submission command based on the scheduler
+        type, dependency, and optional array specification."""
 
-        # Builds command used to submit a job script to the scheduler. 
+        # Builds command used to submit a job script to the scheduler.
         if self.stype == "SLURM":
             cmd = ["sbatch"] # starts the command with the submit tool for SLURM.
             if depends_on: # Checks whether this job should wait for another job first (i.e., if depends_on is not None).
                 cmd += [f"--dependency=afterok:{depends_on}"] # Adds a dependency option so this job only runs after the named job succeeds.
-            cmd.append(script) # Adds the script file path to the command. 
+            if array:  # e.g. "1-500%20": array of 500 tasks, at most 20 running at once.
+                cmd += [f"--array={array}"]
+            cmd.append(script) # Adds the script file path to the command.
             return cmd
 
         if self.stype == "PBS":
             cmd = ["qsub"]
             if depends_on:
                 cmd += ["-W", f"depend=afterok:{depends_on}"]
+            if array:
+                cmd += ["-J", array]           # PBS Pro job array
             cmd.append(script)
             return cmd
 
@@ -194,6 +204,8 @@ class Scheduler:
         cmd = ["qsub"]
         if depends_on:
             cmd += ["-hold_jid", depends_on]
+        if array:
+            cmd += ["-t", array]               # SGE array tasks
         cmd.append(script)
         return cmd
 
@@ -223,8 +235,15 @@ class Scheduler:
 
     def header(self, job_name: str, walltime: str, nodes: int,
                cpus: int, mem: str, gpus: int, account: str,
-               partition: str, log_dir: str, gpu_type: str = "") -> str:
-        """Return the scheduler-specific resource header for a job script."""
+               partition: str, log_dir: str, gpu_type: str = "",
+               array_log: bool = False) -> str:
+        """Return the scheduler-specific resource header for a job script.
+
+        When array_log is True, SLURM output/error filenames use %A_%a
+        (array-job id + task id) so each array task logs to its own file.
+        """
+        # SLURM log tag: per-array-task file for arrays, per-job file otherwise.
+        slurm_tag = "%A_%a" if array_log else "%j"
         # GPU type is required on some clusters (e.g. Alliance rejects a bare gpu request
         # and demand a model, so --gres=gpu:h100:1 rather than --gres=gpu:1).
         # When gpu_type is set, name the model; when blank, request by count.
@@ -256,8 +275,8 @@ class Scheduler:
                 #SBATCH --cpus-per-task={cpus}
                 #SBATCH --mem={mem}
                 #SBATCH --time={walltime}
-                #SBATCH --output={log_dir}/{job_name}_%j.out
-                #SBATCH --error={log_dir}/{job_name}_%j.err
+                #SBATCH --output={log_dir}/{job_name}_{slurm_tag}.out
+                #SBATCH --error={log_dir}/{job_name}_{slurm_tag}.err
                 {part_line}{gpu_line}""")
 
         if self.stype == "PBS":
@@ -360,16 +379,23 @@ class JobScriptFactory:
         modules = self.cfg["env"].get("modules") or []
         module_block = ""
         if modules:
+            mod_list = " ".join(modules)
             module_block = (
-                "# Load cluster modules that provide the docking tools.\n"
+                "# Load cluster modules that provide the docking tools + toolchain.\n"
+                "# A CVMFS/Lmod outage on the compute node makes these fail; abort\n"
+                "# loudly.\n"
                 "if type module &>/dev/null; then\n"
-                f"    module load {' '.join(modules)}\n"
+                f"    module load {mod_list} || {{ echo \"ERROR: 'module load {mod_list}' failed - likely a CVMFS/Lmod problem on this compute node (e.g. 'Transport endpoint is not connected'). Resubmit; if it recurs, report the node to support.\" >&2; exit 1; }}\n"
                 "fi\n"
             )
 
         preamble = textwrap.dedent(f"""\
 
             # -- Environment setup -----------------------------------------
+            # Abort on any failure from here on so the scheduler marks the job
+            # FAILED.  `set -u` is deferred until after activation.
+            set -eo pipefail
+
             export DD_PROJECT_DIR="{self.proj}"
             export DD_ITERATION={iteration}
             export DD_CAMPAIGN="{self.name}"
@@ -379,16 +405,17 @@ class JobScriptFactory:
             # Activate the Python environment (conda env or virtualenv).
             # Modules are loaded first so an Alliance-style venv sees its
             # matching python module, and gnina's prerequisites are in place.
-            {activate}
+            {activate} || {{ echo "ERROR: failed to activate the Python environment. Check for CVMFS/Lmod errors above." >&2; exit 1; }}
 
-            # Abort immediately if any command fails - this ensures the
-            # scheduler marks the job as FAILED rather than silently
-            # continuing into a broken state, which would break the
-            # dependency chain for subsequent phases.
-            set -euo pipefail
+            # Fail fast if the environment did not actually come up,
+            # e.g. a CVMFS/Lmod outage left the modules unloaded and we are on
+            # the bare system python.
+            python -c "import numpy, pandas, rdkit" 2>/dev/null || {{ echo "ERROR: python environment is not usable (numpy/pandas/rdkit import failed). Modules or virtualenv did not activate correctly - check for CVMFS/Lmod errors above." >&2; exit 1; }}
 
-            # nullglob: an unmatched glob expands to nothing, so `for f in dir/*.smi` 
-            # never feeds a bogus "dir/*.smi" path into a tool.  Loops that require 
+            set -u    # environment is up; now also catch unset variables
+
+            # nullglob: an unmatched glob expands to nothing, so `for f in dir/*.smi`
+            # never feeds a bogus "dir/*.smi" path into a tool.  Loops that require
             # input guard against emptiness (below).
             shopt -s nullglob
 
@@ -396,24 +423,77 @@ class JobScriptFactory:
         """)
         return preamble.replace("__DD_MODULES__\n", module_block)
 
+    # Fallbacks for phase keys a config does not define.
+    _DEFAULT_RES = {"nodes": 1, "cpus": 2, "mem": "8G", "gpus": 0}
+    _DEFAULT_WT  = "00:30:00"
+
     def _make_header(self, phase_key: str, job_name: str,
-                     partition_key: str) -> str:
-        """Build the scheduler header for any phase using config lookups."""
-        r   = self.cfg["scheduler"]["resources"][phase_key]
-        wt  = self.cfg["scheduler"]["walltime"][phase_key]
-        acc = self.cfg["scheduler"]["account"]
-        par = self.cfg["scheduler"].get(partition_key, "")   # optional; blank = omit
-        gtype = self.cfg["scheduler"].get("gpu_type", "")    # optional; blank = omit model
+                     partition_key: str, walltime_override: str | None = None,
+                     array_log: bool = False) -> str:
+        """Build the scheduler header for any phase using config lookups.
+
+        walltime_override lets a caller set a computed walltime instead of the 
+        static config value. array_log switches SLURM logs to per-array-task files.
+        """
+        sched = self.cfg["scheduler"]
+        r   = sched["resources"].get(phase_key, self._DEFAULT_RES)
+        wt  = walltime_override or sched["walltime"].get(phase_key, self._DEFAULT_WT)
+        acc = sched["account"]
+        par = sched.get(partition_key, "")     # optional. blank = omit
+        gtype = sched.get("gpu_type", "")      # optional. blank = omit model
         log = f"{self.proj}/logs"
         return self.s.header(job_name, wt, r["nodes"], r["cpus"],
-                             r["mem"], r["gpus"], acc, par, log, gtype)
+                             r["mem"], r["gpus"], acc, par, log, gtype,
+                             array_log)
+
+    # Phase 1 (sampling) is one job that reads/samples every fingerprint chunk,
+    # so its walltime should grow with the number of chunks.
+    _PH1_BASE_SEC       = 1800           # 30 min fixed overhead
+    _PH1_PER_CHUNK_SEC  = 15             # generous per-chunk count + sample I/O
+    _WALLTIME_CAP_SEC   = 24 * 3600      # never auto-request more than 24 h
+
+    @staticmethod
+    def _walltime_to_sec(wt: str) -> int:
+        """Parse HH:MM:SS or D-HH:MM:SS into seconds (0 if unparseable)."""
+        try:
+            days = 0
+            if "-" in wt:
+                d, wt = wt.split("-", 1)
+                days = int(d)
+            parts = [int(x) for x in wt.split(":")]
+            while len(parts) < 3:
+                parts.insert(0, 0)
+            h, m, s = parts
+            return days * 86400 + h * 3600 + m * 60 + s
+        except (ValueError, AttributeError):
+            return 0
+
+    def _scaled_phase1_walltime(self, n_chunks: int | None) -> str | None:
+        """Return a chunk-count-scaled walltime for Phase 1, or None to keep the
+        config value.  Uses max(config, estimate) capped at _WALLTIME_CAP_SEC."""
+        if not n_chunks or n_chunks <= 0:
+            return None
+        est = self._PH1_BASE_SEC + n_chunks * self._PH1_PER_CHUNK_SEC
+        cfg_sec = self._walltime_to_sec(
+            self.cfg["scheduler"]["walltime"].get("phase1_sampling", "00:30:00"))
+        chosen = min(max(est, cfg_sec), self._WALLTIME_CAP_SEC)
+        if chosen <= cfg_sec:
+            return None                      # config already generous enough
+        hh, mm, ss = chosen // 3600, (chosen % 3600) // 60, chosen % 60
+        wt = f"{hh:02d}:{mm:02d}:{ss:02d}"
+        capped = est > self._WALLTIME_CAP_SEC
+        note = "  (CAPPED - consider splitting the library or raising the cap)" if capped else ""
+        print(f"  [auto] Phase 1 walltime scaled to {wt} for {n_chunks} chunks{note}")
+        return wt
 
     # ------------------------------------------------------------------
     # Phase 1: Random sampling from library (iter 1) or predictions (iter N>1)
     # ------------------------------------------------------------------
-    def phase1_sampling(self, iteration: int) -> str:
+    def phase1_sampling(self, iteration: int, n_chunks: int | None = None) -> str:
         job_name = f"{self.name}_i{iteration:02d}_p1_sampling"
-        header   = self._make_header("phase1_sampling", job_name, "cpu_partition")
+        wt_override = self._scaled_phase1_walltime(n_chunks)
+        header   = self._make_header("phase1_sampling", job_name, "cpu_partition",
+                                     walltime_override=wt_override)
 
         dd_dir   = self.cfg["env"]["dd_protocol_dir"]
         ncpu     = self.cfg["scheduler"]["resources"]["phase1_sampling"]["cpus"]
@@ -722,51 +802,78 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
         return header + self._preamble(iteration) + body
 
     # ------------------------------------------------------------------
-    # Phase 5: Inference over the full library
+    # Phase 5: Inference over the full library (5a generate, 5b array)
     # ------------------------------------------------------------------
-    def phase5_inference(self, iteration: int) -> str:
-        job_name = f"{self.name}_i{iteration:02d}_p5_inference"
-        header   = self._make_header("phase5_inference", job_name, "gpu_partition")
+    # DD scores the whole library every iteration, so this phase
+    # grows linearly with library size.  Instead of one job looping over
+    # every chunk, we generate one inference script per fingerprint chunk (5a) and run them as a Slurm job
+    # array (5b). This way, we have one short, constant-memory task per chunk.  Throughput scales
+    # by adding tasks so we don't lengthen job time.
+    def phase5a_generate(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p5a_predgen"
+        header   = self._make_header("phase5a_predgen", job_name, "cpu_partition")
 
         dd_dir = self.cfg["env"]["dd_protocol_dir"]
         fp_dir = self.cfg["library"]["fingerprint_dir"]
-        recall = self.cfg["dd"]["recall"]
 
         body = textwrap.dedent(f"""\
 
-            # -- Phase 5: Library-wide inference (iteration {iteration}) -----
-            # The best DNN model from Phase 4 scores every molecule in the
-            # full fingerprint library.  Molecules whose predicted probability
-            # of being a virtual hit falls below the recall-calibrated threshold
-            # are discarded.  The surviving molecule IDs are written to
-            # morgan_1024_predictions/ - this becomes the sampling pool for
-            # the next iteration's Phase 1.
+            # -- Phase 5a: generate one inference script per fingerprint chunk --
+            # simple_job_predictions_manual.py writes simple_job_1.sh ..
+            # simple_job_N.sh (one per fingerprint file).  Each of those scripts
+            # does `cd $(pwd)` then runs a relative Prediction_morgan_1024.py, so
+            # we must generate them from scripts_2 for that path to resolve on
+            # the compute node when Phase 5b runs them.
 
             ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            mkdir -p "$ITER_DIR"
 
-            # Step 5a: generate one inference script per fingerprint chunk
+            cd "{dd_dir}/scripts_2"
             python "{dd_dir}/scripts_2/simple_job_predictions_manual.py" \\
                 --project_name "{self.name}" \\
                 --file_path "{self.proj}" \\
                 --n_iteration {iteration} \\
                 --morgan_directory "{fp_dir}"
 
-            # Step 5b: run inference on every chunk
-            PRED_SCRIPTS=("$ITER_DIR/simple_job_predictions/"*.sh)
-            if [ ${{#PRED_SCRIPTS[@]}} -eq 0 ]; then
-                echo "ERROR: no inference scripts in $ITER_DIR/simple_job_predictions/ - simple_job_predictions_manual.py produced nothing" >&2
+            NSCRIPTS=$(ls "$ITER_DIR/simple_job_predictions/"simple_job_*.sh 2>/dev/null | wc -l)
+            echo "[$(date)] Phase 5a: generated $NSCRIPTS inference scripts (iteration {iteration})"
+            if [ "$NSCRIPTS" -eq 0 ]; then
+                echo "ERROR: simple_job_predictions_manual.py generated no scripts" >&2
                 exit 1
             fi
-            for SCRIPT in "${{PRED_SCRIPTS[@]}}"; do
-                bash "$SCRIPT"
-            done
+        """)
 
-            # Step 5c: report the number of surviving virtual hits
-            N_HITS=$(ls "$ITER_DIR/morgan_1024_predictions/" | wc -l)
-            echo "[$(date)] Phase 5 complete - iteration {iteration}"
-            echo "Prediction files in morgan_1024_predictions: $N_HITS"
-            echo "Estimated remaining molecules (from best_model_stats.txt):"
-            grep "Total Left" "$ITER_DIR/best_model_stats.txt" 2>/dev/null || true
+        return header + self._preamble(iteration) + body
+
+    def phase5b_array(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p5b_infer"
+        # Reuse the phase5_inference GPU resource spec, but PER TASK: each task
+        # scores a single chunk, so the walltime/mem there is a generous cap.
+        header   = self._make_header("phase5_inference", job_name, "gpu_partition",
+                                     array_log=True)
+
+        body = textwrap.dedent(f"""\
+
+            # -- Phase 5b: library-wide inference (job ARRAY, iteration {iteration}) --
+            # Array task k scores fingerprint chunk k with the Phase-4 model and
+            # writes survivors to morgan_1024_predictions/.  The array width
+            # (1-N) is set at submission from the fingerprint-chunk count.  Work
+            # and memory per task are constant.
+
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            TID="${{SLURM_ARRAY_TASK_ID:-}}"
+            if [ -z "$TID" ]; then
+                echo "ERROR: Phase 5b must run as a SLURM job array (SLURM_ARRAY_TASK_ID unset)." >&2
+                exit 1
+            fi
+            SCRIPT="$ITER_DIR/simple_job_predictions/simple_job_${{TID}}.sh"
+            if [ ! -f "$SCRIPT" ]; then
+                echo "ERROR: inference script not found for array task $TID: $SCRIPT" >&2
+                exit 1
+            fi
+            echo "[$(date)] Phase 5b task $TID -> $SCRIPT"
+            bash "$SCRIPT"
+            echo "[$(date)] Phase 5b task $TID complete"
         """)
 
         return header + self._preamble(iteration) + body
@@ -841,9 +948,13 @@ class DDOrchestrator:
         path.chmod(0o755)
         return str(path)
 
-    def _submit_phase(self, iteration: int, phase: int,
-                      script_content: str, depends_on: str | None) -> str:
-        """Write the script, record it, and submit it."""
+    def _submit_phase(self, iteration: int, phase, script_content: str,
+                      depends_on: str | None, array: str | None = None) -> str:
+        """Write the script, record it, and submit it.
+
+        `phase` may be an int (1-4) or a string sub-key ("5a"/"5b").
+        `array` (e.g. "1-500%20") submits the script as a job array.
+        """
         script_name = f"iter_{iteration:02d}_phase{phase}"
         path = self._write_script(script_name, script_content)
 
@@ -853,13 +964,39 @@ class DDOrchestrator:
               f"(job {existing}) - using existing ID for dependency chain")
             return existing
 
-        job_id = self.scheduler.submit(path, depends_on)
+        job_id = self.scheduler.submit(path, depends_on, array=array)
         # Never persist dry-run job IDs: a later real run would
         # see the phase as already submitted and reuse the fake ID as a real
         # scheduler dependency, which the scheduler rejects.
         if not self.dry_run:
             self.state.record_job(iteration, phase, job_id)
         return job_id
+
+    def _count_fp_chunks(self) -> int:
+        """Count fingerprint chunk files (*.txt) in the library.  This is the
+        number of Phase 5 inference tasks and drives Phase 1 walltime scaling.
+        Environment variables ($SCRATCH, ...) are expanded.  Returns 0 if the
+        directory can't be read."""
+        fp_dir = os.path.expandvars(self.cfg["library"]["fingerprint_dir"])
+        try:
+            return sum(1 for _ in Path(fp_dir).glob("*.txt"))
+        except OSError:
+            return 0
+
+    def _submit_phase5(self, iteration: int, depends_on: str | None,
+                       n_chunks: int, throttle: int) -> str:
+        """Submit Phase 5 as two chained jobs. 5a generates one inference script
+        per fingerprint chunk, and 5b runs them as a job array (1-N%throttle).
+        Returns the array job ID (the dependency for whatever runs next)."""
+        print(f"  Phase 5: Inference  (generate + array over {n_chunks} chunks, "
+              f"<= {throttle} concurrent tasks)")
+        gen_script = self.factory.phase5a_generate(iteration)
+        gen_id = self._submit_phase(iteration, "5a", gen_script, depends_on)
+
+        arr_script = self.factory.phase5b_array(iteration)
+        array_spec = f"1-{n_chunks}%{throttle}"
+        return self._submit_phase(iteration, "5b", arr_script, gen_id,
+                                  array=array_spec)
 
     def run(self, start_iter: int = 1, start_phase: int = 1):
         """
@@ -881,27 +1018,60 @@ class DDOrchestrator:
             print(f"Resuming from iteration {start_iter}, phase {start_phase}")
             print(f"Chaining from job ID: {last_job_id}\n")
 
-        # FIX: PHASES is now a module-level constant, not rebuilt each call.
+        # Count fingerprint chunks once. This drives Phase 1 walltime scaling
+        # and the Phase 5 inference-array width.
+        n_chunks = self._count_fp_chunks()
+        throttle = int(self.cfg["scheduler"].get("array_throttle", 20))
+        if n_chunks < 1:
+            if self.dry_run:
+                print("  [warn] could not count fingerprint chunks; "
+                      "using 1 for this dry-run.")
+                n_chunks = 1
+            else:
+                raise RuntimeError(
+                    "Could not count fingerprint chunk files (*.txt) in "
+                    f"library.fingerprint_dir="
+                    f"{os.path.expandvars(self.cfg['library']['fingerprint_dir'])!r}. "
+                    "Phase 5 needs this to size the inference job array. Check "
+                    "the path exists and holds the prepared fingerprint files."
+                )
+        print(f"  Library fingerprint chunks: {n_chunks} "
+              f"(Phase 5 inference array width)\n")
+        if n_chunks > 1000:
+            print(f"  [note] {n_chunks} inference-array tasks. SLURM caps the "
+                  f"array index (MaxArraySize, often 1001). If submission is "
+                  f"rejected, prepare the library into fewer/larger fingerprint "
+                  f"chunk files, or ask the admins to raise MaxArraySize.\n")
+
+        # Phases 1-4 are single jobs. Phase 5 expands to 5a (generate) + 5b
+        # (job array) and is handled by _submit_phase5.
         phase_methods = {
-            1: self.factory.phase1_sampling,
             2: self.factory.phase2_ligand_prep,
             3: self.factory.phase3_docking,
             4: self.factory.phase4_training,
-            5: self.factory.phase5_inference,
         }
 
         for iteration in range(start_iter, self.total_iter + 1):
             print(f"-- Iteration {iteration} ------------------------------")
             phase_start = start_phase if iteration == start_iter else 1
 
-            for phase_num, phase_fn in phase_methods.items():
+            for phase_num in (1, 2, 3, 4):
                 if phase_num < phase_start:
                     continue
-
                 print(f"  Phase {phase_num}: {PHASES[phase_num]}")
-                script = phase_fn(iteration)
+                if phase_num == 1:
+                    # Phase 1 walltime scales with the library chunk count.
+                    script = self.factory.phase1_sampling(iteration, n_chunks)
+                else:
+                    script = phase_methods[phase_num](iteration)
                 last_job_id = self._submit_phase(
                     iteration, phase_num, script, last_job_id
+                )
+
+            # Phase 5: generate inference scripts + run them as a job array.
+            if phase_start <= 5:
+                last_job_id = self._submit_phase5(
+                    iteration, last_job_id, n_chunks, throttle
                 )
             print()
 
@@ -931,10 +1101,14 @@ class DDOrchestrator:
         # A single flat iteration over (iteration, phase) pairs in reverse
         # is easier to follow and does exactly the same thing.
         for it in range(start_iter, 0, -1):
-            # For the start iteration, look only at phases before start_phase.
-            # For earlier iterations, all 5 phases are candidates.
-            phase_ceiling = (start_phase - 1) if it == start_iter else 5
-            for ph in range(phase_ceiling, 0, -1):
+            if it == start_iter:
+                # Only phases strictly before start_phase in this iteration.
+                cands = list(range(start_phase - 1, 0, -1))
+            else:
+                # A fully-submitted earlier iteration ends with the Phase 5b
+                # inference array (5b depends on 5a depends on phase 4 ...).
+                cands = ["5b", "5a", 4, 3, 2, 1]
+            for ph in cands:
                 jid = self.state.get_job_id(it, ph)
                 if jid:
                     return jid

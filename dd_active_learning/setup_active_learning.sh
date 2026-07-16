@@ -614,20 +614,31 @@ scheduler:
   # request is accepted. Emits --gres=gpu:<gpu_type>:<n> when set.
   gpu_type: "$GPU_TYPE"
 
+  # Phase 5 (library-wide inference) runs as a Slurm job array (one task per
+  # fingerprint chunk). array_throttle
+  # caps concurrent tasks (each uses one GPU slice).
+  array_throttle: 10
+
+  # phase1_sampling walltime auto-scales up with the fingerprint-chunk count
+  # (this is a floor). phase5_inference is per array task (one chunk).
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"
     phase3_docking: "24:00:00"
     phase4_training: "20:00:00"
-    phase5_inference: "06:00:00"
+    phase5a_predgen: "00:30:00"
+    phase5_inference: "02:00:00"
     final_extraction: "02:00:00"
 
+  # GPU note: on MIG clusters (H100 sliced into 3g.40gb/2g.20gb/1g.10gb) keep
+  # cpus proportional to the slice (approx. 6 per slice) or jobs wait long.
   resources:
-    phase1_sampling:  {nodes: 1, cpus: 60, mem: "32G", gpus: 0}
+    phase1_sampling:  {nodes: 1, cpus: 60, mem: "48G", gpus: 0}
     phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G", gpus: 0}
-    phase3_docking:   {nodes: 1, cpus: 16, mem: "64G", gpus: 1}
-    phase4_training:  {nodes: 1, cpus: 8,  mem: "32G", gpus: 1}
-    phase5_inference: {nodes: 1, cpus: 8,  mem: "32G", gpus: 1}
+    phase3_docking:   {nodes: 1, cpus: 6,  mem: "48G", gpus: 1}
+    phase4_training:  {nodes: 1, cpus: 6,  mem: "32G", gpus: 1}
+    phase5a_predgen:  {nodes: 1, cpus: 2,  mem: "8G",  gpus: 0}
+    phase5_inference: {nodes: 1, cpus: 6,  mem: "32G", gpus: 1}
     final_extraction: {nodes: 1, cpus: 60, mem: "32G", gpus: 0}
 
 env:

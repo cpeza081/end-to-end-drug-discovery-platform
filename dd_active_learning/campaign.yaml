@@ -86,22 +86,36 @@ scheduler:
   # Produces  --gres=gpu:<gpu_type>:<n>  (or --gres=gpu:<n> when blank).
   gpu_type: ""
 
-  # Walltime limits per phase. Adjust this based on your system and library size
+  # Phase 5 (library-wide inference) runs as a SLURM job ARRAY with one task per
+  # fingerprint chunk so it scales to billion-size libraries. array_throttle
+  # caps how many tasks run at once (each uses one GPU slice). Raise it if your
+  # allocation has many GPUs free; lower it to be a lighter neighbour.
+  array_throttle: 10
+
+  # Walltime limits per phase. Adjust based on your system and library size.
+  # NOTE: phase1_sampling is auto-scaled up with the fingerprint-chunk count
+  # (this value is a floor). phase5_inference is now per array task (one chunk),
+  # so it can be modest.
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"
     phase3_docking: "24:00:00"
     phase4_training: "20:00:00"
-    phase5_inference: "06:00:00"
+    phase5a_predgen: "00:30:00"   # generate per-chunk inference scripts (cheap)
+    phase5_inference: "02:00:00"  # per inference-array task (one chunk)
     final_extraction: "02:00:00"
 
-  # Resource requests per phase
+  # Resource requests per phase.
+  # GPU note: on MIG clusters (H100 sliced into 3g.40gb/2g.20gb/1g.10gb) keep
+  # cpus proportional to the slice (approx. 6 CPUs per slice) or the job waits a long
+  # time and over-bills.
   resources:
-    phase1_sampling:  {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
+    phase1_sampling:  {nodes: 1, cpus: 60,  mem: "48G",  gpus: 0}
     phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G",  gpus: 0}
-    phase3_docking:   {nodes: 1, cpus: 16,  mem: "64G",  gpus: 1}   # GPU: Gnina / AutoDock-GPU
-    phase4_training:  {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
-    phase5_inference: {nodes: 1, cpus: 8,   mem: "32G",  gpus: 1}
+    phase3_docking:   {nodes: 1, cpus: 6,   mem: "48G",  gpus: 1}   # GPU: Gnina / AutoDock-GPU
+    phase4_training:  {nodes: 1, cpus: 6,   mem: "32G",  gpus: 1}
+    phase5a_predgen:  {nodes: 1, cpus: 2,   mem: "8G",   gpus: 0}   # CPU: writes per-chunk scripts
+    phase5_inference: {nodes: 1, cpus: 6,   mem: "32G",  gpus: 1}   # per array task (one chunk)
     final_extraction: {nodes: 1, cpus: 60,  mem: "32G",  gpus: 0}
 
 # --- Software environment ---------------------------------------------------
