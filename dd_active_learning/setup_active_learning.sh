@@ -368,11 +368,10 @@ if [ -n "$PKG_MGR" ] && [ -f "$ENV_YML" ]; then
 else
     # -------------------- python virtualenv path --------------------
     [ -z "$PKG_MGR" ] && info "No conda/mamba found - building a Python virtualenv with pip."
-    # Load the modules the venv needs at build time here as well as at job run time.
-    #   python  - the venv symlinks to it
-    #   rdkit   - on Alliance, RDKit is a module, it must be
-    #             loaded before the venv is activated. gcc is its prerequisite.
-    # We capture the resolved names so they go into env.modules automatically.
+    # Load the python module the venv symlinks to. For RDKit, Meeko needs rdkit.Chem.rdDetermineBonds,
+    # which some Alliance rdkit builds omit, so probe the module versions
+    # (newest first) for one that provides it. If found we use that
+    # module, otherwise RDKit is installed from PyPI below.
     PY_MODULE=""; RDKIT_MODULE=""
     if type module &>/dev/null; then
         info "Loading python + rdkit modules (gcc prerequisite)..."
@@ -424,7 +423,9 @@ else
                 info "Installing core packages from dd_requirements.txt (~5-15 min)..."
                 pip install --upgrade pip >/dev/null 2>&1 || true
                 pip install -r "$REQ_TXT"
-                # Meeko + gemmi from PyPI, with --no-deps.
+                # Meeko + gemmi from PyPI. RDKit is installed from PyPI only if no
+                # module version provided rdDetermineBonds above, otherwise RDKit
+                # stays the cluster module.
                 if ! python -c "import meeko" 2>/dev/null; then
                     info "Installing Meeko (+gemmi) from PyPI..."
                     PIP_CONFIG_FILE=/dev/null pip install --no-deps gemmi meeko \
@@ -436,7 +437,7 @@ else
             _install_numpy_shim
             python -c "$REQUIRED_IMPORTS" 2>/dev/null \
                 && success "Virtualenv ready and verified: $VENV_DIR" \
-                || warn "Some imports still fail. Check the log above (rdkit must come from its module)."
+                || warn "Some imports still fail. Check the log above."
             deactivate 2>/dev/null || true
         else
             error "Failed to create virtualenv at $VENV_DIR."
@@ -487,8 +488,10 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 # Finalize env.modules: the docking chain from Step 6, plus (for a venv) the
-# python and rdkit modules, which load before the venv activates. Order
-# preserved.
+# python module and, if one with rdDetermineBonds was found, the rdkit module,
+# which must load before the venv activates. If no rdkit module qualified,
+# RDKit came from PyPI and is not listed here. Order preserved: insert the extra
+# modules just before the engine module (the last one).
 FINAL_MODS=("${MODULE_ARR[@]}")
 if [[ "$ENV_ACTIVATE" == *bin/activate* ]]; then
     EXTRA_MODS=()
