@@ -553,8 +553,8 @@ dd:
 scheduler:
   type: "SLURM"
   account: "$SLURM_ACCOUNT"
-  cpu_partition: "cpu"
-  gpu_partition: "gpu"
+  cpu_partition: ""
+  gpu_partition: ""
 
   walltime:
     phase1_sampling: "00:30:00"
