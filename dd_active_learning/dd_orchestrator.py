@@ -748,11 +748,27 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
         """)
 
     # ------------------------------------------------------------------
-    # Phase 4: DNN model training
+    # Phase 4: DNN model training (split: 4a generate, 4b array, 4c evaluate)
     # ------------------------------------------------------------------
-    def phase4_training(self, iteration: int) -> str:
-        job_name = f"{self.name}_i{iteration:02d}_p4_training"
-        header   = self._make_header("phase4_training", job_name, "gpu_partition")
+    # DD trains many hyperparameter models per iteration. The reference protocol
+    # runs them as PARALLEL jobs; running them sequentially in one job makes the
+    # walltime the SUM of all models. So mirror Phase 5: 4a generates one
+    # training script per model, 4b runs them as a job ARRAY (one model/task),
+    # and 4c picks the best model once they are all trained.
+    @staticmethod
+    def _num_training_models(nhp: int) -> int:
+        """Number of models DD's simple_job_models_manual.py actually generates
+        for a given --number_of_hyp (it quantizes to 16/24/48/72/144). Mirrors
+        that script's nested-loop sizing so the training array can be sized
+        without running the generator first."""
+        oss = 3 if nhp >= 72 else (2 if nhp >= 48 else 1)
+        bs  = 2 if nhp >= 144 else 1
+        nu  = 3 if nhp >= 24 else 2
+        return oss * bs * nu * 8      # dropout(2) * bin_array(2) * wt(2) = 8
+
+    def phase4a_labels(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p4a_labels"
+        header   = self._make_header("phase4a_labels", job_name, "cpu_partition")
 
         dd_dir     = self.cfg["env"]["dd_protocol_dir"]
         fp_dir     = self.cfg["library"]["fingerprint_dir"]
@@ -763,29 +779,22 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
         pct_first  = self.cfg["dd"]["percent_first"]
         pct_last   = self.cfg["dd"]["percent_last"]
         recall     = self.cfg["dd"]["recall"]
-
-        # is_last controls whether the final score threshold is applied.
-        # Python's bool -> str gives "True"/"False" which the DD script expects.
-        is_last = str(iteration == total_iter)
-
-        # Iteration 1 docks train + val + test (3 SDF files);
-        # later iterations dock only the training augmentation batch (1 file).
+        # Python bool -> "True"/"False", which the DD script expects.
+        is_last    = str(iteration == total_iter)
+        # Iter 1 docks train+val+test (3 SDFs); later iters only the aug batch.
         n_docking_files = 3 if iteration == 1 else 1
 
         body = textwrap.dedent(f"""\
 
-            # -- Phase 4: DNN model training (iteration {iteration}) ---------
-            # 4a: Extract binary labels (virtual hit / non-hit) from SDF scores.
-            #     The score_keyword must match the SDF field name exactly.
-            # 4b: Train {num_models} DNN models with different hyperparameters
-            #     via grid search, then select the best-performing model.
-            #
-            # The DNN learns to predict docking scores from Morgan fingerprints,
-            # enabling fast inference over the full library in Phase 5.
+            # -- Phase 4a: labels + generate one training script per model ------
+            # extract_labels turns docking scores into binary hit/non-hit labels;
+            # simple_job_models_manual writes simple_job_1.sh .. simple_job_N.sh
+            # (one per hyperparameter model). Those scripts `cd $(pwd)` then run a
+            # RELATIVE progressive_docking.py, so generate them from scripts_2.
 
             ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            mkdir -p "$ITER_DIR"
 
-            # Step 4a: convert SDF docking scores -> binary label files
             python "{dd_dir}/scripts_2/extract_labels.py" \\
                 --project_name "{self.name}" \\
                 --file_path "{self.proj}" \\
@@ -793,7 +802,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
                 --tot_process {n_docking_files} \\
                 --score_keyword '{score_kw}'
 
-            # Step 4b: generate training job scripts for all {num_models} models
+            cd "{dd_dir}/scripts_2"
             python "{dd_dir}/scripts_2/simple_job_models_manual.py" \\
                 --iteration_no {iteration} \\
                 --morgan_directory "{fp_dir}" \\
@@ -806,18 +815,68 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
                 --percent_last_mols {pct_last} \\
                 --recall {recall}
 
-            # Step 4c: run all model training scripts sequentially
-            # (GPU resource is shared across them within this job allocation)
-            TRAIN_SCRIPTS=("$ITER_DIR/simple_job/"*.sh)
-            if [ ${{#TRAIN_SCRIPTS[@]}} -eq 0 ]; then
-                echo "ERROR: no training scripts in $ITER_DIR/simple_job/ - simple_job_models_manual.py produced nothing" >&2
+            NMODELS=$(ls "$ITER_DIR/simple_job/"simple_job_*.sh 2>/dev/null | wc -l)
+            echo "[$(date)] Phase 4a: generated $NMODELS model-training scripts (iteration {iteration})"
+            if [ "$NMODELS" -eq 0 ]; then
+                echo "ERROR: simple_job_models_manual.py generated no scripts" >&2
                 exit 1
             fi
-            for SCRIPT in "${{TRAIN_SCRIPTS[@]}}"; do
-                bash "$SCRIPT"
-            done
+        """)
 
-            # Step 4d: grid search - select the best model by test-set precision
+        return header + self._preamble(iteration) + body
+
+    def phase4b_array(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p4b_train"
+        # Per-task = one model, so this header's walltime is PER MODEL (DD docs:
+        # usually <= ~12 h per model).
+        header   = self._make_header("phase4_training", job_name, "gpu_partition",
+                                     array_log=True)
+
+        body = textwrap.dedent(f"""\
+
+            # -- Phase 4b: train one DNN model per array task (iteration {iteration}) --
+            # Array task k trains the k-th hyperparameter model. Work and memory
+            # per task are one model's, so models train in parallel and the phase
+            # walltime is per MODEL, not the sum. Models are saved to all_models/
+            # for 4c to evaluate.
+
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            TID="${{SLURM_ARRAY_TASK_ID:-}}"
+            if [ -z "$TID" ]; then
+                echo "ERROR: Phase 4b must run as a SLURM job array (SLURM_ARRAY_TASK_ID unset)." >&2
+                exit 1
+            fi
+            SCRIPT="$ITER_DIR/simple_job/simple_job_${{TID}}.sh"
+            if [ ! -f "$SCRIPT" ]; then
+                echo "ERROR: training script not found for array task $TID: $SCRIPT" >&2
+                exit 1
+            fi
+            echo "[$(date)] Phase 4b task $TID -> $SCRIPT"
+            bash "$SCRIPT"
+            echo "[$(date)] Phase 4b task $TID complete"
+        """)
+
+        return header + self._preamble(iteration, gpu=True) + body
+
+    def phase4c_eval(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p4c_eval"
+        # Grid-search evaluation of the trained models. Runs on CPU (TF falls
+        # back to CPU) so it doesn't compete for scarce GPUs; it's modest work.
+        header   = self._make_header("phase4c_eval", job_name, "cpu_partition")
+
+        dd_dir = self.cfg["env"]["dd_protocol_dir"]
+        fp_dir = self.cfg["library"]["fingerprint_dir"]
+        val_sz = self.cfg["dd"]["val_size"]
+        recall = self.cfg["dd"]["recall"]
+
+        body = textwrap.dedent(f"""\
+
+            # -- Phase 4c: grid search - pick the best model (iteration {iteration}) --
+            # Runs after every 4b task; evaluates the trained models and selects
+            # the most precise one, which Phase 5 uses for library-wide inference.
+
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+
             python "{dd_dir}/scripts_2/hyperparameter_result_evaluation.py" \\
                 --n_iteration {iteration} \\
                 --data_path "{self.proj}/{self.name}" \\
@@ -830,7 +889,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             cat "$ITER_DIR/best_model_stats.txt" 2>/dev/null || true
         """)
 
-        return header + self._preamble(iteration, gpu=True) + body
+        return header + self._preamble(iteration) + body
 
     # ------------------------------------------------------------------
     # Phase 5: Inference over the full library (5a generate, 5b array)
@@ -1055,6 +1114,35 @@ class DDOrchestrator:
         return self._submit_phase(iteration, "5b", arr_script, b_dep,
                                   array=array_spec)
 
+    def _submit_phase4(self, iteration: int, depends_on: str | None,
+                       throttle: int, resume: bool = False) -> str:
+        """Submit Phase 4 as three chained jobs: 4a generates one training
+        script per hyperparameter model, 4b trains them as a job array
+        (1-N%throttle), and 4c evaluates them and picks the best. Returns the
+        4c job ID (the dependency for Phase 5).
+
+        As in Phase 5, when resuming, a sub-step that is already COMPLETED
+        (kept, skipped here) must not be used as an afterok dependency for the
+        next sub-step. Its inputs are on disk, so that step depends on None."""
+        n_models = self._num_training_models(self.cfg["dd"]["num_models"])
+        print(f"  Phase 4: Training  (generate + array over {n_models} models, "
+              f"<= {throttle} concurrent) + evaluate")
+
+        a_already = self.state.is_phase_submitted(iteration, "4a")
+        gen_id = self._submit_phase(iteration, "4a",
+                                    self.factory.phase4a_labels(iteration),
+                                    depends_on)
+
+        b_already = self.state.is_phase_submitted(iteration, "4b")
+        b_dep = None if (resume and a_already) else gen_id
+        arr_id = self._submit_phase(iteration, "4b",
+                                    self.factory.phase4b_array(iteration),
+                                    b_dep, array=f"1-{n_models}%{throttle}")
+
+        c_dep = None if (resume and b_already) else arr_id
+        return self._submit_phase(iteration, "4c",
+                                  self.factory.phase4c_eval(iteration), c_dep)
+
     def _actual_state(self, job_id: str | None) -> str:
         """Query the scheduler for a job's aggregated final state (array-aware).
         Returns COMPLETED / CANCELLED / FAILED / ... or MISSING/UNKNOWN."""
@@ -1084,7 +1172,7 @@ class DDOrchestrator:
         """
         order: list[tuple] = []
         for it in range(1, self.total_iter + 1):
-            for ph in (1, 2, 3, 4, "5a", "5b"):
+            for ph in (1, 2, 3, "4a", "4b", "4c", "5a", "5b"):
                 order.append((it, ph))
         order.append(("final", "final"))
 
@@ -1119,6 +1207,8 @@ class DDOrchestrator:
         it, ph = order[resume_idx]
         if ph == "final":
             return (self.total_iter + 1, 1)     # loop is empty; only final runs
+        if ph in ("4a", "4b", "4c"):
+            return (it, 4)
         if ph in ("5a", "5b"):
             return (it, 5)
         return (it, ph)
@@ -1188,19 +1278,19 @@ class DDOrchestrator:
                   f"rejected, prepare the library into fewer/larger fingerprint "
                   f"chunk files, or ask the admins to raise MaxArraySize.\n")
 
-        # Phases 1-4 are single jobs. Phase 5 expands to 5a (generate) + 5b
-        # (job array) and is handled by _submit_phase5.
+        # Phases 1-3 are single jobs. Phase 4 expands to 4a (generate) + 4b
+        # (training array) + 4c (evaluate). Phase 5 expands to 5a (generate) + 5b
+        # (inference array). Both multi-step phases have their own submitters.
         phase_methods = {
             2: self.factory.phase2_ligand_prep,
             3: self.factory.phase3_docking,
-            4: self.factory.phase4_training,
         }
 
         for iteration in range(start_iter, self.total_iter + 1):
             print(f"-- Iteration {iteration} ------------------------------")
             phase_start = start_phase if iteration == start_iter else 1
 
-            for phase_num in (1, 2, 3, 4):
+            for phase_num in (1, 2, 3):
                 if phase_num < phase_start:
                     continue
                 print(f"  Phase {phase_num}: {PHASES[phase_num]}")
@@ -1211,6 +1301,12 @@ class DDOrchestrator:
                     script = phase_methods[phase_num](iteration)
                 last_job_id = self._submit_phase(
                     iteration, phase_num, script, last_job_id
+                )
+
+            # Phase 4: labels + training array + evaluation.
+            if phase_start <= 4:
+                last_job_id = self._submit_phase4(
+                    iteration, last_job_id, throttle, resume=resume_mode
                 )
 
             # Phase 5: generate inference scripts + run them as a job array.
@@ -1256,8 +1352,8 @@ class DDOrchestrator:
                 cands = list(range(start_phase - 1, 0, -1))
             else:
                 # A fully-submitted earlier iteration ends with the Phase 5b
-                # inference array (5b depends on 5a depends on phase 4 ...).
-                cands = ["5b", "5a", 4, 3, 2, 1]
+                # inference array (5b <- 5a <- 4c <- 4b <- 4a <- phase 3 ...).
+                cands = ["5b", "5a", "4c", "4b", "4a", 3, 2, 1]
             for ph in cands:
                 jid = self.state.get_job_id(it, ph)
                 if jid:

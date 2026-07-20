@@ -182,12 +182,15 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
         print(f"\n  Iteration {it:2d}")
         print(f"  {'-'*55}")
 
-        # Phases 1-4 are single jobs. Phase 5 is two steps: 5a (generate the
-        # inference scripts) and 5b (the inference job array).
+        # Phases 1-3 are single jobs. Phase 4 is three steps (4a labels+gen,
+        # 4b training array, 4c evaluate). Phase 5 is two steps (5a gen, 5b array).
         phase_rows = [(str(p), PHASE_NAMES[p], f"phase{p}_job_id")
-                      for p in (1, 2, 3, 4)]
-        phase_rows.append(("5a", "Pred-gen",  "phase5a_job_id"))
-        phase_rows.append(("5b", "Inference", "phase5b_job_id"))
+                      for p in (1, 2, 3)]
+        phase_rows.append(("4a", "Labels+gen",  "phase4a_job_id"))
+        phase_rows.append(("4b", "Train array", "phase4b_job_id"))
+        phase_rows.append(("4c", "Best model",  "phase4c_job_id"))
+        phase_rows.append(("5a", "Pred-gen",    "phase5a_job_id"))
+        phase_rows.append(("5b", "Inference",   "phase5b_job_id"))
 
         for label, phase_name, key in phase_rows:
             job_id = it_data.get(key)

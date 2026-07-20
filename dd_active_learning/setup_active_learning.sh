@@ -618,18 +618,21 @@ scheduler:
   # Blank = exclude none. Example: "fc10101,fc10102" or "fc[10101-10105]".
   exclude_nodes: ""
 
-  # Phase 5 (library-wide inference) runs as a Slurm job array (one task per
-  # fingerprint chunk). array_throttle
-  # caps concurrent tasks (each uses one GPU slice).
+  # Phases 4 (training) and 5 (inference) run as Slurm job arrays with one task per
+  # hyperparameter model (4b) and per fingerprint chunk (5b). array_throttle
+  # caps concurrent tasks (each uses one GPU).
   array_throttle: 10
 
   # phase1_sampling walltime auto-scales up with the fingerprint-chunk count
-  # (this is a floor). phase5_inference is per array task (one chunk).
+  # (a floor). phase4_training is per model (one array task; DD: <= ~12h/model).
+  # phase5_inference is per inference task (one chunk).
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"
     phase3_docking: "24:00:00"
-    phase4_training: "20:00:00"
+    phase4a_labels: "01:00:00"
+    phase4_training: "12:00:00"
+    phase4c_eval: "02:00:00"
     phase5a_predgen: "00:30:00"
     phase5_inference: "02:00:00"
     final_extraction: "02:00:00"
@@ -640,7 +643,9 @@ scheduler:
     phase1_sampling:  {nodes: 1, cpus: 60, mem: "48G", gpus: 0}
     phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G", gpus: 0}
     phase3_docking:   {nodes: 1, cpus: 6,  mem: "48G", gpus: 1}
+    phase4a_labels:   {nodes: 1, cpus: 8,  mem: "16G", gpus: 0}
     phase4_training:  {nodes: 1, cpus: 6,  mem: "32G", gpus: 1}
+    phase4c_eval:     {nodes: 1, cpus: 8,  mem: "32G", gpus: 0}
     phase5a_predgen:  {nodes: 1, cpus: 2,  mem: "8G",  gpus: 0}
     phase5_inference: {nodes: 1, cpus: 6,  mem: "32G", gpus: 1}
     final_extraction: {nodes: 1, cpus: 60, mem: "32G", gpus: 0}
