@@ -1124,7 +1124,7 @@ class DDOrchestrator:
         As in Phase 5, when resuming, a sub-step that is already COMPLETED
         (kept, skipped here) must not be used as an afterok dependency for the
         next sub-step. Its inputs are on disk, so that step depends on None."""
-        n_models = self._num_training_models(self.cfg["dd"]["num_models"])
+        n_models = self.factory._num_training_models(self.cfg["dd"]["num_models"])
         print(f"  Phase 4: Training  (generate + array over {n_models} models, "
               f"<= {throttle} concurrent) + evaluate")
 
