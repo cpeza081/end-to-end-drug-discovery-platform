@@ -122,7 +122,9 @@ tautomer:
   # 1 = dominant tautomer only (recommended for DD).
   max_to_return: 1
 
-  # Allow methyl tautomerism.  false = recommended by VS prep SOP.
+  # Allow hybridisation changes on carbons adjacent to heteroatoms.
+  # KEEP FALSE.
+  # The pipeline always writes "-ch3 false" explicitly.
   ch3: false
 
   # Append wart suffixes to tautomer names.

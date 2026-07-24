@@ -10,10 +10,17 @@ likely protonation state at physiological pH (7.4).
 
 -ch3 false flag:
 ───────────────
-The ``-ch3 false`` flag prevents TAUTOMERS from considering methyl group
-tautomerism, which can produce chemically unreasonable structures near
-heteroatom-containing rings.  This is the setting recommended in the VS
-preparation SOP for this pipeline.
+``-ch3`` allows tautomers to change the hybridisation state of carbons
+adjacent to heteroatoms.  On heteroatom-rich ring systems this produces
+chemically unreasonable structures, so it must be kept ``false``.
+
+IMPORTANT: deviation from the Nature Protocols paper: OpenEye changed the
+default for ``-ch3`` to *true* in a recent QUACPAC release (it was false in
+the 2022 version the protocol was written against).  This caused widespread
+corruption of the pan-Canadian library in a previous screen.  Both flags are
+therefore always written out explicitly rather than left to the default:
+
+    tautomers -in Y.smi -out Y_h.smi -maxtoreturn 1 -ch3 false -warts false
 
 Graceful fallback
 ─────────────────
@@ -97,10 +104,9 @@ class TautomerStep(PipelineStep):
                 "-out",          str(out),
                 "-maxtoreturn",  str(cfg.max_to_return),
             ]
-            if not cfg.ch3:
-                cmd.extend(["-ch3", "false"])
-            if cfg.warts:
-                cmd.append("-warts")
+            # Both flags are passed explicitly.
+            cmd.extend(["-ch3", "true" if cfg.ch3 else "false"])
+            cmd.extend(["-warts", "true" if cfg.warts else "false"])
             if cfg.extra_args:
                 cmd.extend(cfg.extra_args.split())
             commands.append(cmd)

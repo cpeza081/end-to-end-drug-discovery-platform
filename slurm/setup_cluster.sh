@@ -316,7 +316,9 @@ flipper:
 tautomer:
   enabled: $TAUTOMER_ENABLED
   max_to_return: 1
+  # KEEP FALSE.
   ch3: false
+  warts: false
 
 organize:
   enabled: true

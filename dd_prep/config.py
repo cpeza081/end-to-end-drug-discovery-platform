@@ -133,10 +133,15 @@ class TautomerConfig:
 
     Command produced:
         tautomers -in <chunk>_isom.smi -out <chunk>_states.smi
-                  -maxtoreturn 1 [-ch3 false] [-warts false]
+                  -maxtoreturn 1 -ch3 false -warts false
 
-    -ch3 false:  avoids hybridisation changes near heteroatoms that can
-                 corrupt ring systems (recommended by VS prep SOP).
+    -ch3 false:  avoids hybridisation changes on carbons near heteroatoms,
+                 which corrupt heteroatom-rich ring systems.
+
+                 NOTE: OpenEye changed this default to *true* in a recent
+                 QUACPAC release (false in the 2022 version used for the
+                 Nature Protocols paper).  Both -ch3 and -warts are always
+                 emitted explicitly so the default can never leak in.
 
     Reference: https://docs.eyesopen.com/applications/quacpac/tautomers/
     """
