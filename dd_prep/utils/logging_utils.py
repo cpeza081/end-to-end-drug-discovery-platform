@@ -75,6 +75,10 @@ def setup_logging(
     # Clear existing handlers to avoid duplicate output on re-calls.
     root.handlers.clear()
 
+    # Don't hand records up to the real root logger. cli.py calls
+    # logging.basicConfig(), which attaches a handler there.
+    root.propagate = False
+
     _fmt_console = "%(asctime)s  %(levelname)-8s  %(name)-28s  %(message)s" # The format string for log messages in the console; includes timestamp, level, logger name, and message. The levelname is left-aligned in an 8-character field, and the name is left-aligned in a 28-character field for consistent formatting.
     _fmt_file    = "%(asctime)s  %(levelname)-8s  %(name)-28s  %(message)s"
     _datefmt_console = "%H:%M:%S" # Console logs only show time for brevity, since the file log has the full date and time.

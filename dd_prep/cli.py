@@ -7,6 +7,7 @@ the package is installed you can run:
     dd-prep --config my_config.yaml
     dd-prep --input library.smi --work-dir ./prep_out --dry-run
     dd-prep --config my_config.yaml --validate-only
+    dd-prep --config my_config.yaml --step filter
 
 All arguments are optional — any value not supplied on the command line
 falls back to the YAML config, which in turn falls back to the dataclass
@@ -59,6 +60,14 @@ examples:
 
   # Re-run from scratch, ignoring previous checkpoint
   dd-prep --config my_config.yaml --no-resume
+
+  # Filter only: apply the property filters and report how many
+  # molecules survive, without running any downstream step
+  dd-prep --config my_config.yaml --step filter
+
+  # Same, but force a re-filter after editing thresholds in the config
+  # (without --no-resume the previous filtered file is reused)
+  dd-prep --config my_config.yaml --step filter --no-resume
         """,
     )
 
@@ -88,7 +97,9 @@ examples:
         metavar="STEP",
         choices=sorted(_ALL_STEPS),
         help=(
-            "Run only this pipeline step. "
+            "Run only this pipeline step and stop. "
+            "'--step filter' applies the property filters and prints the "
+            "number of molecules remaining. "
             f"Array-capable steps: {sorted(_ARRAY_STEPS)}. "
             f"Sequential steps: {sorted(_SEQUENTIAL_STEPS)}."
         ),
@@ -135,6 +146,24 @@ examples:
     )
 
     return parser
+
+
+def _print_filter_result(ctx) -> None:
+    """
+    Print the surviving molecule count as a single bare line on stdout.
+
+    The logger already writes a formatted summary block, but that output
+    carries timestamps and ANSI colour, which makes it awkward to scrape.
+    This line is deliberately plain so a Slurm script can do:
+
+        N=$(dd-prep -c cfg.yaml --step filter | grep '^molecules_remaining=' | cut -d= -f2)
+
+    Does nothing if the filter step was disabled or never ran.
+    """
+    n = ctx.get("n_molecules_filtered") if ctx is not None else None
+    if n is None:
+        return
+    print(f"molecules_remaining={n}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -193,11 +222,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(0 if ok else 1) # exit with 0 if validation passed, 1 if it failed, so this can be used in scripts and CI pipelines to block execution if the config isn't valid.
 
     if args.step:
-        # Single-step mode: used by SLURM array jobs.
-        pipeline.run_single_step(
+        # Single-step mode: used by Slurm array jobs and by filter-only runs.
+        ctx = pipeline.run_single_step(
             step_name=args.step,
             chunk_index=args.chunk_index,
         )
+        if args.step == "filter":
+            _print_filter_result(ctx)
     else:
         # Full pipeline mode: normal local / login-node usage.
         pipeline.run()

@@ -26,10 +26,22 @@ How a new step is added:
 3. Register it in pipeline.py's step list.
 -----------------
 
+Filter-only runs
+-----------------
+``dd-prep --step filter --config my.yaml`` runs this step alone and prints a
+summary block with the number of molecules remaining.  Use it to size a
+library, or to sweep thresholds before committing to a full prep run.
+
+Note that re-running with different thresholds requires ``--no-resume``
+(or deleting filtered/library_filtered.smi); otherwise the existing output
+is reused and the new thresholds are ignored.
+
 Input  (from ctx):  "input_file"   - path to raw SMILES library
 Output (to ctx):    "filter_file"  - path to filtered SMILES library
                     "n_molecules_raw"      - molecule count before filter
+                                             (None when resumed from disk)
                     "n_molecules_filtered" - molecule count after filter
+                    "n_molecules_invalid"  - unparseable SMILES dropped
 """
 
 from __future__ import annotations
@@ -91,13 +103,29 @@ class FilterStep(PipelineStep):
         # If output already exists, populate context and return.
         # This pattern is identical in every step, so any interrupted pipeline
         # can be restarted at the failed step.
-        if out_file.is_file():
+        # Honour the resume flag: with resume=false (--no-resume) an existing
+        # output is overwritten. Without this check, re-running after editing
+        # thresholds would reuse the old file and report stale counts.
+        resume: bool = ctx.get("resume", True)
+        if resume and out_file.is_file():
             self.logger.info(
                 "Resuming -- filtered file already exists: %s", out_file
             )
             n_filt = sum(1 for _ in out_file.open()) - 1  # subtract header
             ctx.set("filter_file", out_file)
             ctx.set("n_molecules_filtered", n_filt)
+            ctx.set("n_molecules_raw", None)
+            ctx.set("n_molecules_invalid", None)
+            # Raw / invalid counts are not recoverable from the output file,
+            # so the summary reports what is known and says so.
+            self._log_summary(
+                input_file=input_file,
+                out_file=out_file,
+                n_raw=None,
+                n_invalid=None,
+                n_passed=n_filt,
+                resumed=True,
+            )
             return ctx
  
         # ---- Detect file format from first line only -------------------------
@@ -194,19 +222,62 @@ class FilterStep(PipelineStep):
                 "  %d molecules had unparseable SMILES and were dropped.",
                 n_invalid,
             )
-        self.logger.info(
-            "  Filter complete: %d / %d molecules passed (%.1f %%).",
-            n_passed, n_raw, 100 * n_passed / max(n_raw, 1),
+
+        self._log_summary(
+            input_file=input_file,
+            out_file=out_file,
+            n_raw=n_raw,
+            n_invalid=n_invalid,
+            n_passed=n_passed,
+            resumed=False,
         )
-        self.logger.info("  Written to %s", out_file)
- 
+
         ctx.set("filter_file", out_file)
         ctx.set("n_molecules_filtered", n_passed)
         ctx.set("n_molecules_raw", n_raw)
+        ctx.set("n_molecules_invalid", n_invalid)
         return ctx
  
     # ---- Helpers -------------------------------------------------------------
- 
+
+    def _log_summary(
+        self,
+        input_file: Path,
+        out_file: Path,
+        n_raw: int | None,
+        n_invalid: int | None,
+        n_passed: int,
+        resumed: bool,
+    ) -> None:
+        """
+        Emit the end-of-step summary block.
+
+        Goes through the logger, so it lands both on the console (stdout) and
+        in work_dir/dd_prep.log. The headline number is "molecules remaining",
+        which is what a filter-only run is usually asking for.
+
+        n_raw / n_invalid are None on a resumed run: those counts live only in
+        the original run's log, not in the output file, so they are reported
+        as unavailable.
+        """
+        log = self.logger.info
+        bar = "-" * 58
+
+        log(bar)
+        log("  FILTER SUMMARY%s", "  (resumed from existing output)" if resumed else "")
+        log("    Input                : %s", input_file)
+        if n_raw is not None:
+            log("    Molecules read       : %s", f"{n_raw:,}")
+        else:
+            log("    Molecules read       : n/a (see original run log)")
+        if n_invalid:
+            log("    Unparseable, dropped : %s", f"{n_invalid:,}")
+        log("    MOLECULES REMAINING  : %s", f"{n_passed:,}")
+        if n_raw:
+            log("    Pass rate            : %.2f %%", 100 * n_passed / n_raw)
+        log("    Output               : %s", out_file)
+        log(bar)
+
     @staticmethod
     def _detect_format(path: Path) -> tuple[str, str, str]:
         """
