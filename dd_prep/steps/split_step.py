@@ -48,12 +48,29 @@ class SplitStep(PipelineStep):
 
     def validate(self, ctx: PipelineContext) -> list[str]:
         errors: list[str] = []
-        source = ctx.get("filter_file") or ctx.get("input_file", "") 
-        if not source or not Path(source).is_file(): # Check the filter output first since it's preferred; fall back to raw input.
-            errors.append(
-                f"Source file not found: '{source}'. "
-                "Set input_file in config or enable the filter step."
-            )
+        # Prefer the filtered library, but fall back to the raw input. The raw
+        # input may now be several files, in which case split cannot consume
+        # it directly. the filter step is what merges them into one stream.
+        filter_file = ctx.get("filter_file")
+        if filter_file:
+            if not Path(filter_file).is_file():
+                errors.append(f"Source file not found: '{filter_file}'.")
+        else:
+            raw_inputs = ctx.get("input_files") or []
+            if isinstance(raw_inputs, (str, Path)):
+                raw_inputs = [raw_inputs]
+            if len(raw_inputs) > 1:
+                errors.append(
+                    f"The filter step is disabled and {len(raw_inputs)} input "
+                    "files were given, but split reads a single source. "
+                    "Either enable the filter step (it merges the files into "
+                    "one library), or concatenate them yourself first."
+                )
+            elif not raw_inputs or not Path(raw_inputs[0]).is_file():
+                errors.append(
+                    f"Source file not found: '{raw_inputs[0] if raw_inputs else ''}'. "
+                    "Set input_file in config or enable the filter step."
+                )
         if self.config.chunk_size < 1: 
             errors.append(f"chunk_size must be >= 1, got {self.config.chunk_size}.")
         return errors
@@ -69,7 +86,23 @@ class SplitStep(PipelineStep):
         # Track whether we're consuming the filtered intermediate (which may be
         # deleted afterwards) versus the user's raw input (which never is).
         filter_file = ctx.get("filter_file")
-        source = Path(filter_file or ctx.require("input_file"))
+        if filter_file:
+            source = Path(filter_file)
+        else:
+            # No filter output: fall back to the raw input, which must be a
+            # single file (validate() rejects the multi-file case with an
+            # explanation, so this is a defensive guard rather than the
+            # primary error path).
+            raw_inputs = ctx.get("input_files") or ctx.require("input_file")
+            if isinstance(raw_inputs, (str, Path)):
+                raw_inputs = [raw_inputs]
+            if len(raw_inputs) != 1:
+                raise ValueError(
+                    f"split needs a single source file but got {len(raw_inputs)} "
+                    "raw inputs and no filtered library. Enable the filter step "
+                    "to merge them, or concatenate them first."
+                )
+            source = Path(raw_inputs[0])
         out_dir = self._mkdir(ctx.work_dir / "smiles")
 
         # ── Resume check ──────────────────────────────────────────────────────

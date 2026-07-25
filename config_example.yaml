@@ -12,11 +12,32 @@
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-# Path to the raw SMILES library.
+# The raw SMILES library.
 # Expected format: space-separated, two columns, with header line:
 #   smiles idnumber
 #   CCO    ZINC000001
 #   c1ccccc1 ZINC000002
+# Extra columns (mw, catalog id, price, ...) are ignored. Only the SMILES
+# and ID columns are read.  Every file is assumed to have a header row.
+#
+# Three forms are accepted, so a library that ships pre-split across several
+# files does not need concatenating first:
+#
+#   input_file: /path/to/your/library.smi          # one file
+#
+#   input_file:                                    # explicit list
+#     - /data/library_part1.smi
+#     - /data/library_part2.smi
+#
+#   input_file: "/data/library_part*.smi"          # glob
+#
+# Multiple files are streamed in order into one filtered library, so every
+# downstream stage is unchanged. A list is read in the order written; a glob
+# is sorted lexicographically, so zero-pad your suffixes (part01, part02) or
+# use an explicit list if part10-before-part2 would bother you.
+#
+# Note: the filter step is what merges the files. If you disable it and pass
+# more than one input, the split step will stop with an error.
 input_file: /path/to/your/library.smi
 
 # All intermediate and final outputs are written inside this directory.

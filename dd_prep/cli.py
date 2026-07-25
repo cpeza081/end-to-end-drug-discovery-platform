@@ -61,6 +61,10 @@ examples:
   # Re-run from scratch, ignoring previous checkpoint
   dd-prep --config my_config.yaml --no-resume
 
+  # Library pre-split across several files (merged into one filtered library)
+  dd-prep --input part1.smi part2.smi part3.smi --work-dir ./prep_output
+  dd-prep --input 'library_parts/*.smi' --work-dir ./prep_output
+
   # Filter only: apply the property filters and report how many
   # molecules survive, without running any downstream step
   dd-prep --config my_config.yaml --step filter
@@ -81,7 +85,14 @@ examples:
     parser.add_argument(
         "--input", "-i",
         metavar="FILE",
-        help="Input SMILES library (space-separated, 'smiles idnumber' header).",
+        nargs="+",
+        help=(
+            "Input SMILES library (space-separated, 'smiles idnumber' header; "
+            "extra columns are ignored). "
+            "Accepts several paths, or a quoted glob, for a library that is "
+            "pre-split across files: -i part1.smi part2.smi  or  -i 'parts/*.smi'. "
+            "Multiple files are merged into one filtered library."
+        ),
     )
     parser.add_argument(
         "--work-dir", "-o",
@@ -190,7 +201,10 @@ def main(argv: list[str] | None = None) -> None:
     # ── Translate CLI args into config overrides ──────────────────────────────
     overrides: dict[str, object] = {}
     if args.input:
-        overrides["input_file"] = args.input
+        # argparse always hands back a list with nargs="+". Unwrap a single
+        # entry so the saved run_config.yaml records the same shape the user
+        # would have written by hand.
+        overrides["input_file"] = args.input[0] if len(args.input) == 1 else args.input
     if args.work_dir:
         overrides["work_dir"] = args.work_dir
     if args.dry_run:
@@ -205,16 +219,27 @@ def main(argv: list[str] | None = None) -> None:
     if not cfg.input_file:
         parser.error(
             "input_file is required. "
-            "Set it in your config file or pass --input <file>."
+            "Set it in your config file or pass --input <file> [<file> ...]."
         )
-    if not Path(cfg.input_file).is_file():
-        parser.error(f"Input file does not exist: '{cfg.input_file}'")
+    # Resolve here so a bad path or an empty glob fails immediately with a
+    # clear message, rather than part-way through a long run.
+    try:
+        resolved_inputs = cfg.input_files()
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+    if not resolved_inputs:
+        parser.error(f"No input files matched: {cfg.input_file!r}")
 
     # ── Set up logging level before pipeline initialises ─────────────────────
     level = logging.DEBUG if args.verbose else logging.INFO # If we want more logging output, that is controlled by the --verbose flag.
     logging.basicConfig(level=level)   # root logger. pipeline will refine it
 
     # ── Build and run ─────────────────────────────────────────────────────────
+    if len(resolved_inputs) > 1:
+        print(f"Resolved {len(resolved_inputs)} input files:")
+        for path in resolved_inputs:
+            print(f"  {path}")
+
     pipeline = Pipeline(cfg)
 
     if args.validate_only:

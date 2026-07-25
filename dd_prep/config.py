@@ -15,6 +15,7 @@ Loading priority (highest wins):
 from __future__ import annotations # for Python 3.10+ type hinting (e.g. dict[str, Any])
 
 import copy
+import glob
 from dataclasses import dataclass, field, asdict # @dataclass auto-generates init, repr, etc. and asdict() converts to dict from a dataclass tree. 
 # field() is used to specify default_factory for nested dataclasses, required when a default is a mutable type like a dict or list. 
 # Without it, Python would share the same object instance across all instances of PipelineConfig, which is not what we want.
@@ -259,9 +260,27 @@ class PipelineConfig:
     """
 
     # ── I/O ──────────────────────────────────────────────────────────────
-    # Path to the raw SMILES library.  Expected format: two-column
-    # space-separated file with headers 'smiles' and 'idnumber'.
-    input_file: str = ""
+    # The raw SMILES library.  Expected format: space-separated file with
+    # headers 'smiles' and 'idnumber'.  Extra columns (mw, catalog id, ...)
+    # are ignored.  Every file is assumed to have a header row.
+    #
+    # Accepts three forms, so a library that ships pre-split across several
+    # files does not have to be concatenated first:
+    #
+    #   input_file: /data/library.smi                  # one file
+    #   input_file:                                    # explicit list
+    #     - /data/library_part1.smi
+    #     - /data/library_part2.smi
+    #   input_file: "/data/library_part*.smi"          # glob
+    #
+    # A list is processed in the order written. A glob is sorted, so
+    # part10 sorts before part2. zero-pad your suffixes, or use a list,
+    # if the order matters to you. Order does not affect which molecules
+    # survive the filter, only the row order of the output.
+    #
+    # Use input_files() to read this; it normalises all three forms to an
+    # ordered list of existing paths.
+    input_file: str | list[str] = ""
 
     # Root working directory; all intermediate and final outputs live here.
     work_dir: str = "./dd_prep_workdir"
@@ -303,6 +322,81 @@ class PipelineConfig:
     omega: OmegaConfig = field(default_factory=OmegaConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
     fingerprint: FingerprintConfig = field(default_factory=FingerprintConfig)
+
+    # ── I/O helpers ───────────────────────────────────────────────────────────
+
+    def input_files(self) -> list[Path]:
+        """
+        Resolve ``input_file`` to an ordered list of existing paths.
+
+        Normalises the three accepted forms (single path, list of paths,
+        glob pattern) so callers never have to care which was used.
+
+        Returns
+        -------
+        list[Path]
+            Existing files, de-duplicated, in the order they should be read.
+            A list is kept in the order written; a glob is sorted.
+
+        Raises
+        ------
+        FileNotFoundError
+            If an explicitly named path is missing, or a glob matches
+            nothing. Explicit paths are checked individually so the error
+            names the one that is wrong.
+        """
+        return resolve_input_files(self.input_file)
+
+
+def resolve_input_files(spec: str | list[str] | None) -> list[Path]:
+    """
+    Expand an ``input_file`` specification into an ordered list of paths.
+
+    Accepts a single path, a list of paths, or a glob pattern. Entries in a
+    list may themselves be globs. Order is preserved for explicit entries.
+    The expansion of any single glob is sorted.
+
+    Duplicates are removed while preserving first-seen order, so overlapping
+    globs (or a file named twice) cannot double-count molecules.
+    """
+    if spec is None or spec == "":
+        return []
+
+    entries = [spec] if isinstance(spec, (str, Path)) else list(spec)
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+
+    for entry in entries:
+        text = str(entry).strip()
+        if not text:
+            continue
+
+        if any(ch in text for ch in "*?["):
+            # Glob: sorted for determinism. Note this is lexicographic, so
+            # part10 precedes part2 unless suffixes are zero-padded.
+            matches = sorted(Path(p) for p in glob.glob(text))
+            if not matches:
+                raise FileNotFoundError(
+                    f"Input pattern matched no files: '{text}'"
+                )
+            candidates = matches
+        else:
+            # Explicit path: must exist. Checked here so the error names the
+            # offending entry instead of surfacing as a wrong file count.
+            path = Path(text)
+            if not path.is_file():
+                raise FileNotFoundError(f"Input file does not exist: '{text}'")
+            candidates = [path]
+
+        for path in candidates:
+            key = path.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(path)
+
+    return resolved
     
 
 # ─────────────────────────────────────────────────────────────────────────────#

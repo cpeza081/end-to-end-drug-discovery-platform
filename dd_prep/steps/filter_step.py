@@ -86,16 +86,26 @@ class FilterStep(PipelineStep):
             from rdkit import Chem  # noqa: F401
         except ImportError:
             errors.append("RDKit is required for the filter step: pip install rdkit")
-        input_file = ctx.get("input_file", "")
-        if not input_file or not Path(input_file).is_file():
-            errors.append(f"Input file not found: '{input_file}'")
+        # input_file may be a single path, a list, or a glob; the pipeline
+        # resolves it to a list before the step ever sees it.
+        input_files = _as_path_list(ctx.get("input_files") or ctx.get("input_file"))
+        if not input_files:
+            errors.append(
+                "No input files. Set input_file in the config (a path, a list "
+                "of paths, or a glob pattern)."
+            )
+        for path in input_files:
+            if not path.is_file():
+                errors.append(f"Input file not found: '{path}'")
         return errors
  
     # ---- Execution -----------------------------------------------------------
  
     def run(self, ctx: PipelineContext) -> PipelineContext:
         cfg: FilterConfig = self.config # type hint for convenience; self.config is actually just a dict, but we know from the pipeline setup that it has the structure of FilterConfig, so this lets us access config parameters with dot notation and get autocompletion in IDEs.
-        input_file = Path(ctx.require("input_file"))
+        input_files = _as_path_list(ctx.get("input_files") or ctx.require("input_file"))
+        if not input_files:
+            raise ValueError("No input files to filter.")
         out_dir = self._mkdir(ctx.work_dir / "filtered") # each step gets its own subdirectory under the main work_dir, which is named after the step for clarity. The _mkdir helper creates it if it doesn't exist and returns the path.
         out_file = out_dir / "library_filtered.smi" 
 
@@ -119,25 +129,17 @@ class FilterStep(PipelineStep):
             # Raw / invalid counts are not recoverable from the output file,
             # so the summary reports what is known and says so.
             self._log_summary(
-                input_file=input_file,
+                input_files=input_files,
                 out_file=out_file,
                 n_raw=None,
                 n_invalid=None,
                 n_passed=n_filt,
+                per_file=None,
                 resumed=True,
             )
             return ctx
  
-        # ---- Detect file format from first line only -------------------------
-        # Column detection runs on the first line so we never load the
-        # full file into memory.
-        sep, smiles_col, id_col = self._detect_format(input_file)
-        self.logger.info(
-            "  Detected format: sep=%r  smiles_col=%r  id_col=%r",
-            sep, smiles_col, id_col,
-        )
- 
-        # ---- Stream through file in fixed-size chunks ------------------------
+        # ---- Worker pool -----------------------------------------------------
         # Each pandas chunk is read from disk, then its rows are fanned out to a
         # pool of worker processes that do the RDKit parsing, descriptor
         # calculation, and threshold test. RDKit work is CPU-bound and
@@ -147,24 +149,17 @@ class FilterStep(PipelineStep):
         n_workers = max(1, int(getattr(cfg, "n_workers", 1)))
         thresholds = _thresholds_from_config(cfg)
 
-        self.logger.info(
-            "  Streaming %s in chunks of %d molecules using %d worker(s) ...",
-            input_file, self.STREAM_CHUNK_SIZE, n_workers,
-        )
+        if len(input_files) > 1:
+            self.logger.info(
+                "  %d input files -> one merged output, %d worker(s).",
+                len(input_files), n_workers,
+            )
 
         n_raw = n_invalid = n_passed = 0
-
-        reader = pd.read_csv(
-            input_file,
-            sep=sep,
-            engine="python",
-            skipinitialspace=True,
-            chunksize=self.STREAM_CHUNK_SIZE,
-            usecols=[smiles_col, id_col],  # skip extra columns (e.g. Enamine
-                                            # catalog fields) at read time
-        )
+        per_file: list[tuple[Path, int, int]] = []  # (path, read, passed)
 
         # Use a 'spawn' pool (fork is unsafe with RDKit on some platforms).
+        # The pool is created once and reused across all input files.
         pool = None
         mapper = map  # serial default
         if n_workers > 1:
@@ -175,42 +170,79 @@ class FilterStep(PipelineStep):
             mapper = lambda fn, it: pool.imap(fn, it)
 
         try:
+            # A single output stream, opened once. Every input file appends to
+            # it, and the header is written once regardless of how many
+            # inputs there are or whether they carry headers themselves.
             with open(out_file, "w") as out_fh:
-                out_fh.write("smiles idnumber\n")  # header, exactly once
+                out_fh.write("smiles idnumber\n")
 
-                for chunk_idx, chunk in enumerate(reader):
-                    # Standardise column names
-                    chunk.columns = [c.strip().lower() for c in chunk.columns]
-                    chunk = chunk.rename(
-                        columns={smiles_col: "smiles", id_col: "idnumber"}
-                    ).fillna("")
+                for file_no, in_path in enumerate(input_files, start=1):
+                    # Format is detected per file: a library split across
+                    # several files is not guaranteed to be internally
+                    # consistent, and a later shard may use a different
+                    # separator or column order.
+                    sep, smiles_col, id_col = self._detect_format(in_path)
+                    self.logger.info(
+                        "  [%d/%d] %s  sep=%r smiles=%r id=%r",
+                        file_no, len(input_files), in_path.name,
+                        sep, smiles_col, id_col,
+                    )
 
-                    n_raw += len(chunk)
+                    file_raw, file_passed = 0, 0
 
-                    # Split this pandas chunk into small row batches and process
-                    # them across the worker pool. Each batch returns the passing
-                    # "smiles idnumber" lines plus (raw, invalid, passed) counts.
-                    rows = list(zip(chunk["smiles"].tolist(),
-                                    chunk["idnumber"].tolist()))
-                    batches = [
-                        (rows[i:i + self.WORKER_BATCH_SIZE], thresholds)
-                        for i in range(0, len(rows), self.WORKER_BATCH_SIZE)
-                    ]
+                    reader = pd.read_csv(
+                        in_path,
+                        sep=sep,
+                        engine="python",
+                        skipinitialspace=True,
+                        chunksize=self.STREAM_CHUNK_SIZE,
+                        usecols=[smiles_col, id_col],  # skip extra columns at read time
+                    )
 
-                    for lines, (b_raw, b_invalid, b_passed) in mapper(
-                        _filter_batch, batches
-                    ):
-                        if lines:
-                            out_fh.write("".join(lines))
-                        n_invalid += b_invalid
-                        n_passed += b_passed
+                    for chunk_idx, chunk in enumerate(reader):
+                        # Standardise column names
+                        chunk.columns = [str(c).strip().lower() for c in chunk.columns]
+                        chunk = chunk.rename(
+                            columns={smiles_col: "smiles", id_col: "idnumber"}
+                        ).fillna("")
 
-                    # Progress log every 10 chunks (every 5M molecules at default
-                    # chunk size) so long runs aren't silent
-                    if (chunk_idx + 1) % 10 == 0:
+                        n_raw += len(chunk)
+                        file_raw += len(chunk)
+
+                        # Split this pandas chunk into small row batches and
+                        # process them across the worker pool. Each batch
+                        # returns the passing "smiles idnumber" lines plus
+                        # (raw, invalid, passed) counts.
+                        rows = list(zip(chunk["smiles"].tolist(),
+                                        chunk["idnumber"].tolist()))
+                        batches = [
+                            (rows[i:i + self.WORKER_BATCH_SIZE], thresholds)
+                            for i in range(0, len(rows), self.WORKER_BATCH_SIZE)
+                        ]
+
+                        for lines, (b_raw, b_invalid, b_passed) in mapper(
+                            _filter_batch, batches
+                        ):
+                            if lines:
+                                out_fh.write("".join(lines))
+                            n_invalid += b_invalid
+                            n_passed += b_passed
+                            file_passed += b_passed
+
+                        # Progress log every 10 chunks (every 5M molecules at
+                        # default chunk size) so long runs aren't silent
+                        if (chunk_idx + 1) % 10 == 0:
+                            self.logger.info(
+                                "  ... %d molecules processed, %d passed so far",
+                                n_raw, n_passed,
+                            )
+
+                    per_file.append((in_path, file_raw, file_passed))
+                    if len(input_files) > 1:
                         self.logger.info(
-                            "  ... %d molecules processed, %d passed so far",
-                            n_raw, n_passed,
+                            "  [%d/%d] %s done: %s read, %s passed",
+                            file_no, len(input_files), in_path.name,
+                            f"{file_raw:,}", f"{file_passed:,}",
                         )
         finally:
             if pool is not None:
@@ -224,11 +256,12 @@ class FilterStep(PipelineStep):
             )
 
         self._log_summary(
-            input_file=input_file,
+            input_files=input_files,
             out_file=out_file,
             n_raw=n_raw,
             n_invalid=n_invalid,
             n_passed=n_passed,
+            per_file=per_file if len(input_files) > 1 else None,
             resumed=False,
         )
 
@@ -242,11 +275,12 @@ class FilterStep(PipelineStep):
 
     def _log_summary(
         self,
-        input_file: Path,
+        input_files: list[Path],
         out_file: Path,
         n_raw: int | None,
         n_invalid: int | None,
         n_passed: int,
+        per_file: list[tuple[Path, int, int]] | None,
         resumed: bool,
     ) -> None:
         """
@@ -265,7 +299,20 @@ class FilterStep(PipelineStep):
 
         log(bar)
         log("  FILTER SUMMARY%s", "  (resumed from existing output)" if resumed else "")
-        log("    Input                : %s", input_file)
+        if len(input_files) == 1:
+            log("    Input                : %s", input_files[0])
+        else:
+            log("    Inputs               : %d files", len(input_files))
+            for path in input_files:
+                log("                           %s", path)
+
+        # Per-file breakdown makes a truncated or mis-globbed shard obvious.
+        if per_file:
+            log("    Per file             :")
+            for path, f_raw, f_passed in per_file:
+                pct = (100 * f_passed / f_raw) if f_raw else 0.0
+                log("                           %-28s %12s read  %12s passed (%.1f %%)",
+                    path.name, f"{f_raw:,}", f"{f_passed:,}", pct)
         if n_raw is not None:
             log("    Molecules read       : %s", f"{n_raw:,}")
         else:
@@ -282,13 +329,21 @@ class FilterStep(PipelineStep):
     def _detect_format(path: Path) -> tuple[str, str, str]:
         """
         Detect separator, SMILES column name, and ID column name by reading
-        only the first line of the file.
- 
+        only the first two lines of the file.
+
         Returns (sep, smiles_col, id_col) using the lowercased header names
         exactly as they appear in the file, so they can be passed directly
         to pd.read_csv(usecols=...).
+
+        Every input file is assumed to have a header row.
+
+        Files with more than two columns are supported. Vendor catalogues
+        routinely carry extra fields (mw, logp, catalog id, price). Only the
+        two identified columns are read. The rest are dropped by
+        pd.read_csv(usecols=...) without being parsed, so extra columns
+        cost nothing. The two columns need not be the first two and need not
+        be adjacent.
         """
-        from rdkit import Chem
  
         with open(path) as fh:
             first_line = fh.readline().strip()
@@ -324,18 +379,65 @@ class FilterStep(PipelineStep):
  
         if smiles_col and id_col:
             return sep, smiles_col, id_col
- 
-        # Fall back: try parsing the first data cell with RDKit
+        
         if second_line:
             data_cols = re.split(r"[\t, ]+", second_line)
             if len(data_cols) >= 2:
-                if Chem.MolFromSmiles(data_cols[0].strip()) is not None:
-                    return sep, cols[0], cols[1]
-                else:
-                    return sep, cols[1], cols[0]
- 
+                smi_idx, id_idx = FilterStep._pick_columns(data_cols)
+                # Guard against a header row with fewer names than the data
+                # row has fields (ragged file). fall back to positional names.
+                if max(smi_idx, id_idx) < len(cols):
+                    return sep, cols[smi_idx], cols[id_idx]
+
         # Last resort: assume first two columns are smiles, id
         return sep, cols[0], cols[1]
+
+    @staticmethod
+    def _pick_columns(fields: list[str]) -> tuple[int, int]:
+        """
+        Given the fields of one data row, return (smiles_index, id_index).
+
+        The SMILES column is the first field RDKit can parse as a molecule.
+        The identifier is then chosen as the first remaining field that is
+        NOT purely numeric. Molecule IDs are strings ("ZINC000001",
+        "EN300-12345", "MOL1"), whereas the extra columns in a vendor
+        catalogue are almost always numeric (mw, logp, price, purity). This
+        is what stops a three-column "smiles mw id" file from having its
+        molecular weight adopted as the identifier.
+
+        If every non-SMILES field is numeric, the first one is used, since
+        some identifier really is a bare number.
+        """
+        from rdkit import Chem, RDLogger
+
+        cleaned = [f.strip() for f in fields]
+
+        RDLogger.DisableLog("rdApp.*")
+        try:
+            smi_idx = next(
+                (i for i, f in enumerate(cleaned)
+                 if f and Chem.MolFromSmiles(f) is not None),
+                0,
+            )
+        finally:
+            RDLogger.EnableLog("rdApp.*")
+
+        def _is_number(text: str) -> bool:
+            try:
+                float(text)
+                return True
+            except ValueError:
+                return False
+
+        id_idx = next(
+            (i for i, f in enumerate(cleaned)
+             if i != smi_idx and f and not _is_number(f)),
+            None,
+        )
+        if id_idx is None:
+            id_idx = next((i for i in range(len(cleaned)) if i != smi_idx), 0)
+
+        return smi_idx, id_idx
 
 
 # ---- Parallel worker (module-level so it can be pickled by 'spawn') ----------
@@ -499,3 +601,21 @@ def _count_stereocentres(mol) -> int:
         1 for element in Chem.FindPotentialStereo(mol)
         if element.type == Chem.StereoType.Atom_Tetrahedral
     )
+
+
+def _as_path_list(spec) -> list[Path]:
+    """
+    Coerce whatever is in the context under "input_files" / "input_file"
+    into a list of Path.
+
+    The pipeline normally resolves the config spec (path, list, or glob) and
+    puts a ready-made list in the context, but this step is also reachable
+    directly in tests and from run_single_step, so it accepts a bare string
+    or Path too. Globs are not expanded here as that is the config layer's
+    job.
+    """
+    if spec is None or spec == "":
+        return []
+    if isinstance(spec, (str, Path)):
+        return [Path(spec)]
+    return [Path(p) for p in spec]

@@ -251,7 +251,13 @@ class Pipeline:
     def _build_context(self) -> PipelineContext:
         """Initialise a fresh PipelineContext from the current config."""
         ctx = PipelineContext(work_dir=self.work_dir)
-        ctx.set("input_file", self.config.input_file)
+        # Resolve the input spec (single path, list, or glob) once, here, so
+        # every step downstream sees the same concrete ordered file list and
+        # no step re-expands a glob and risks a different answer.
+        input_files = self.config.input_files()
+        ctx.set("input_files", input_files)
+        # Kept for backward compatibility with anything reading the old key.
+        ctx.set("input_file", input_files[0] if len(input_files) == 1 else input_files)
         ctx.set("n_parallel", self.config.n_parallel)
         ctx.set("dry_run",    self.config.dry_run)
         ctx.set("resume",     self.config.resume)
@@ -328,7 +334,13 @@ class Pipeline:
         disabled = [s.name for s in self.steps if not s.enabled]
         logger.info("=" * 62)
         logger.info("Deep Docking library preparation pipeline")
-        logger.info("  Input  : %s", self.config.input_file)
+        input_files = self.config.input_files()
+        if len(input_files) == 1:
+            logger.info("  Input  : %s", input_files[0])
+        else:
+            logger.info("  Input  : %d files", len(input_files))
+            for path in input_files:
+                logger.info("           %s", path)
         logger.info("  Output : %s", self.work_dir.resolve())
         logger.info("  Steps  : %s", ", ".join(enabled))
         if disabled:
