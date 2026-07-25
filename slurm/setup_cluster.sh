@@ -97,17 +97,79 @@ fi
 success "Using account: $SLURM_ACCOUNT"
 
 # ── Step 2: Input SMILES library ──────────────────────────────────────────────
-ask "Full path to your input SMILES library (.smi file):"
-read -r INPUT_FILE
+# Accepts a single path, several space-separated paths, or a glob. A library
+# pre-split across files does not need concatenating: the filter step streams
+# them all into one filtered library.
+#
+# INPUT_YAML ends up holding the value written into the config, already in
+# YAML form (either a quoted scalar or a flow sequence).
+ask "Path to your input SMILES library.
+  One file:      /project/lib/library.smi
+  Several files: /project/lib/part1.smi /project/lib/part2.smi
+  Or a glob:     /project/lib/part*.smi"
+read -r INPUT_RAW
 
-if [ -f "$INPUT_FILE" ]; then
-    FILE_SIZE=$(du -sh "$INPUT_FILE" 2>/dev/null | cut -f1)
-    success "Found library $INPUT_FILE ($FILE_SIZE)."
-else
-    warn "File not found: $INPUT_FILE"
-    warn "You can update input_file in the config later."
-    INPUT_FILE="/path/to/your/library.smi"
-fi
+# Expand the answer into an array. Unquoted so both space separation and
+# glob expansion happen. a glob that matches nothing stays literal, which
+# the -f test below then rejects.
+resolve_inputs() {
+    local raw="$1"
+    RESOLVED=()
+    local entry
+    # shellcheck disable=SC2086
+    for entry in $raw; do
+        if [ -f "$entry" ]; then
+            RESOLVED+=("$entry")
+        fi
+    done
+}
+
+INPUT_YAML=""
+while true; do
+    resolve_inputs "$INPUT_RAW"
+    N_INPUTS=${#RESOLVED[@]}
+
+    if [ "$N_INPUTS" -eq 0 ]; then
+        warn "No files matched: $INPUT_RAW"
+        ask "Try again, or press Enter to skip and edit the config by hand:"
+        read -r INPUT_RAW
+        if [ -z "$INPUT_RAW" ]; then
+            warn "Skipping. Set input_file in the config before running."
+            INPUT_YAML='"/path/to/your/library.smi"'
+            break
+        fi
+        continue
+    fi
+
+    TOTAL_SIZE=$(du -shc "${RESOLVED[@]}" 2>/dev/null | tail -1 | cut -f1)
+    if [ "$N_INPUTS" -eq 1 ]; then
+        success "Found 1 file (${TOTAL_SIZE}): ${RESOLVED[0]}"
+        # Always quoted: an unquoted value containing a leading '*' is read
+        # by YAML as an alias and makes the config unparseable.
+        INPUT_YAML="\"${RESOLVED[0]}\""
+    else
+        success "Found $N_INPUTS files (${TOTAL_SIZE} total):"
+        for entry in "${RESOLVED[@]}"; do
+            echo "    $entry"
+        done
+        echo ""
+        echo "  These will be merged into one filtered library by the filter step."
+        ask "Use these $N_INPUTS files? (Y/n):"
+        read -r CONFIRM
+        if [[ "$CONFIRM" =~ ^[Nn]$ ]]; then
+            ask "Enter the path, paths, or glob again:"
+            read -r INPUT_RAW
+            continue
+        fi
+        # YAML flow sequence, every element quoted.
+        INPUT_YAML="["
+        for entry in "${RESOLVED[@]}"; do
+            INPUT_YAML="$INPUT_YAML\"$entry\", "
+        done
+        INPUT_YAML="${INPUT_YAML%, }]"
+    fi
+    break
+done
 
 # ── Step 3: Output directory ──────────────────────────────────────────────────
 DEFAULT_WORK_DIR="$SCRATCH/dd_prep_output"
@@ -276,8 +338,8 @@ TAUTOMER_ENABLED=$( [ "$OE_WORKS" = true ] && echo "true" || echo "false" )
 cat > "$CONFIG_FILE" << YAML
 # dd_prep configuration — generated $(date)
 
-input_file: $INPUT_FILE
-work_dir:   $WORK_DIR
+input_file: $INPUT_YAML
+work_dir:   "$WORK_DIR"
 
 n_parallel: 4
 resume: true
@@ -301,6 +363,17 @@ filter:
   total_rings_min: 3
   total_rings_max: 4
   formal_charge: 0
+
+  # Max tetrahedral stereocentres per molecule, counting both declared
+  # (@ / @@) and unspecified centres. null = no limit.
+  # Flipper enumerates every unspecified centre, so a molecule with n
+  # undeclared centres becomes 2^n isomers.
+  chiral_centers_max: null
+
+  # Every threshold above accepts null to switch it off, and the descriptor
+  # is then not computed. For a single-property pass (e.g. stereocentres
+  # only) set all the others to null.
+
   # RDKit worker processes — the filter throughput lever.
   # Match --cpus-per-task in slurm/01_filter_split.sh.
   n_workers: 32
