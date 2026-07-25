@@ -42,7 +42,9 @@ class FilterConfig:
 
     Mirrors the logic in the original extract_smiles.py but exposes every
     threshold as an independently adjustable parameter.  Any threshold can
-    be disabled by setting it to None.
+    be disabled by setting it to None (``null`` in YAML). The corresponding
+    descriptor is then never computed, so switching a filter off also makes
+    the step cheaper.
 
     Reference: Gentile et al. Nature Protocols 2022 — pre-filtering section.
     """
@@ -77,7 +79,16 @@ class FilterConfig:
     total_rings_max: int = 4
 
     # Only keep neutral molecules. Charged species would require counter-ions that complicate docking.
-    formal_charge: int = 0
+    formal_charge: int | None = 0
+
+    # Ceiling on the number of tetrahedral stereocentres per molecule,
+    # counting BOTH those declared in the SMILES (@ / @@) and those left
+    # unspecified.  None = no limit (default; preserves pre-existing
+    # behaviour for configs that don't mention it).
+    #
+    # Note this counts tetrahedral atoms only; double-bond (E/Z) stereo is
+    # not included.
+    chiral_centers_max: int | None = None
 
     # Number of worker processes used to parse SMILES and compute descriptors.
     # RDKit parsing/descriptor calculation is CPU-bound and single-threaded per

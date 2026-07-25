@@ -80,6 +80,15 @@ filter:
   # Only keep neutral molecules (formal charge = 0).
   formal_charge: 0
 
+  # Maximum number of tetrahedral stereocentres per molecule, counting both
+  # those declared in the SMILES (@ / @@) and those left unspecified.
+  # null = no limit (default).
+  chiral_centers_max: null
+
+  # NOTE: every threshold above accepts null to switch it off, and the
+  # underlying descriptor is then never computed. To run a single-property
+  # pass (e.g. stereocentres only) set all the others to null.
+
   # Worker processes for RDKit parsing / descriptor calculation.
   # This is the main lever on filter run time — set it to the number of
   # cores available to the job (match --cpus-per-task in 01_filter_split.sh).

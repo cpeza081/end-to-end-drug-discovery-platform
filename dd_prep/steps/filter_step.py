@@ -360,6 +360,7 @@ def _thresholds_from_config(cfg: FilterConfig) -> dict:
         "total_rings_min": cfg.total_rings_min,
         "total_rings_max": cfg.total_rings_max,
         "formal_charge":   cfg.formal_charge,
+        "chiral_centers_max": getattr(cfg, "chiral_centers_max", None),
     }
 
 
@@ -394,6 +395,23 @@ def _filter_batch(
     lines: list[str] = []
     n_invalid = 0
 
+    # Decide once per batch which descriptors are actually needed. A threshold
+    # of None disables its check, and we then skip computing the descriptor
+    # entirely rather than computing it and ignoring the result.
+    do_slogp  = th["slogp_min"] is not None or th["slogp_max"] is not None
+    do_rot    = th["rot_bonds_max"] is not None
+    do_mw     = th["mw_min"] is not None or th["mw_max"] is not None
+    do_fsp3   = th["fsp3_min"] is not None
+    do_aro    = th["aro_rings_min"] is not None or th["aro_rings_max"] is not None
+    do_aliph  = th["aliph_rings_max"] is not None
+    do_total  = th["total_rings_min"] is not None or th["total_rings_max"] is not None
+    do_charge = th["formal_charge"] is not None
+    do_chiral = th["chiral_centers_max"] is not None
+    # Ring counts feed the total-rings test, so they may be needed even when
+    # their own individual thresholds are off.
+    need_aro   = do_aro or do_total
+    need_aliph = do_aliph or do_total
+
     for smiles, idnumber in rows:
         s = str(smiles) if smiles is not None else ""
         if not s:
@@ -406,28 +424,78 @@ def _filter_batch(
             continue
 
         # Short-circuit threshold tests, cheapest / most-selective first.
-        slogp = Descriptors.MolLogP(mol)
-        if not (th["slogp_min"] <= slogp <= th["slogp_max"]):
+        if do_slogp and _outside(Descriptors.MolLogP(mol),
+                                 th["slogp_min"], th["slogp_max"]):
             continue
-        if Descriptors.NumRotatableBonds(mol) > th["rot_bonds_max"]:
+        if do_rot and Descriptors.NumRotatableBonds(mol) > th["rot_bonds_max"]:
             continue
-        mw = Descriptors.ExactMolWt(mol)
-        if not (th["mw_min"] <= mw <= th["mw_max"]):
+        if do_mw and _outside(Descriptors.ExactMolWt(mol),
+                              th["mw_min"], th["mw_max"]):
             continue
-        if rdMolDescriptors.CalcFractionCSP3(mol) < th["fsp3_min"]:
+        if do_fsp3 and rdMolDescriptors.CalcFractionCSP3(mol) < th["fsp3_min"]:
             continue
-        aro = rdMolDescriptors.CalcNumAromaticRings(mol)
-        if not (th["aro_rings_min"] <= aro <= th["aro_rings_max"]):
+
+        if need_aro:
+            aro = rdMolDescriptors.CalcNumAromaticRings(mol)
+            if do_aro and _outside(aro, th["aro_rings_min"], th["aro_rings_max"]):
+                continue
+        if need_aliph:
+            aliph = rdMolDescriptors.CalcNumAliphaticRings(mol)
+            if do_aliph and aliph > th["aliph_rings_max"]:
+                continue
+        if do_total and _outside(aro + aliph,
+                                 th["total_rings_min"], th["total_rings_max"]):
             continue
-        aliph = rdMolDescriptors.CalcNumAliphaticRings(mol)
-        if aliph > th["aliph_rings_max"]:
+
+        if do_charge and rdmolops.GetFormalCharge(mol) != th["formal_charge"]:
             continue
-        tot = aro + aliph
-        if not (th["total_rings_min"] <= tot <= th["total_rings_max"]):
-            continue
-        if rdmolops.GetFormalCharge(mol) != th["formal_charge"]:
+
+        # Stereocentre cap goes last: it is the most expensive remaining test
+        # (roughly the cost of parsing the molecule again), so it only runs on
+        # molecules that already survived everything else.
+        if do_chiral and _count_stereocentres(mol) > th["chiral_centers_max"]:
             continue
 
         lines.append(f"{s} {idnumber}\n")
 
     return lines, (len(rows), n_invalid, len(lines))
+
+
+def _outside(value, lo, hi) -> bool:
+    """
+    True if *value* falls outside the closed interval [lo, hi].
+
+    A bound of None is treated as unbounded on that side, which is how a
+    half-open filter (e.g. "MW at most 450, no lower limit") is expressed.
+    """
+    if lo is not None and value < lo:
+        return True
+    if hi is not None and value > hi:
+        return True
+    return False
+
+
+def _count_stereocentres(mol) -> int:
+    """
+    Number of tetrahedral stereocentres, counting specified and unspecified.
+
+    Uses Chem.FindPotentialStereo, RDKit's current stereo perception. It
+    reports every potential stereo element with a .specified flag, so one
+    call covers both declared (@ / @@) and undeclared centres.
+
+    Deliberately NOT implemented as
+        CalcNumAtomStereoCenters + CalcNumUnspecifiedAtomStereoCenters
+    which is the obvious-looking approach but double-counts: once
+    AssignStereochemistry has run with flagPossibleStereoCenters, the
+    unspecified centres are included in both terms. That overcounts an
+    all-undeclared molecule by exactly 2x.
+
+    Double-bond (E/Z) stereo is excluded. Only Atom_Tetrahedral elements
+    are counted.
+    """
+    from rdkit import Chem
+
+    return sum(
+        1 for element in Chem.FindPotentialStereo(mol)
+        if element.type == Chem.StereoType.Atom_Tetrahedral
+    )
