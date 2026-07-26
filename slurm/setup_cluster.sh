@@ -189,6 +189,7 @@ info "Loading modules..."
 module purge
 module load StdEnv/2023
 module load python/3.11
+module load scipy-stack
 module load gcc rdkit
 success "Modules loaded."
 
@@ -212,31 +213,64 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
-# pip install with live output (no --quiet) so progress is visible
-info "Upgrading pip..."
-pip install --upgrade pip 2>&1 | while IFS= read -r line; do
-    printf "\r  ${BLUE}→${RESET}  %-70s" "$line"
-done
-printf "\r%-80s\r" " "
-success "pip upgraded."
+# pip install with live output (no --quiet) so progress is visible.
+pip_run() {
+    local label="$1"; shift
+    info "$label"
+    pip "$@" 2>&1 | tee "$VENV_DIR/.last_pip.log" | while IFS= read -r line; do
+        printf "\r  ${BLUE}→${RESET}  %-70s" "$line"
+    done
+    local status=${PIPESTATUS[0]}
+    printf "\r%-80s\r" " "
+    if [ "$status" -ne 0 ]; then
+        error "$label failed (pip exit $status)."
+        echo ""
+        echo "  Last 15 lines of pip output:"
+        tail -15 "$VENV_DIR/.last_pip.log" | sed 's/^/    /'
+        echo ""
+        error "Setup aborted. Nothing downstream will work until this is fixed."
+        exit 1
+    fi
+}
 
-info "Installing dependencies (pyyaml, pandas, tqdm)..."
-pip install pyyaml pandas tqdm 2>&1 | while IFS= read -r line; do
-    printf "\r  ${BLUE}→${RESET}  %-70s" "$line"
-done
-printf "\r%-80s\r" " "
-success "Dependencies installed."
+pip_run "Upgrading pip..."        install --upgrade pip
+# pandas and numpy come from the scipy-stack module.
+pip_run "Installing dependencies (pyyaml, tqdm)..." install pyyaml tqdm
+pip_run "Installing dd_prep..."   install "$PROJECT_DIR" --force-reinstall
 
-info "Installing dd_prep..."
-pip install "$PROJECT_DIR" --force-reinstall 2>&1 | while IFS= read -r line; do
-    printf "\r  ${BLUE}→${RESET}  %-70s" "$line"
-done
-printf "\r%-80s\r" " "
+# ── Verify ────────────────────────────────────────────────────────────────────
+# We have two checks.
+#
+#   1. Imports, run from a directory that is not the repo. Python puts the
+#      current directory on sys.path, so "import dd_prep" from the repo root
+#      succeeds whether or not pip installed anything.
+#   2. The dd-prep console script. The Slurm jobs invoke `dd-prep`, not
+#      `import dd_prep`, so a missing entry point is what actually breaks a
+#      run and it is invisible to an import check.
+VERIFY_FAILED=false
 
-# Verify
-python -c "import rdkit, dd_prep, pandas, yaml" 2>/dev/null \
-    && success "All imports verified (rdkit, dd_prep, pandas, yaml)." \
-    || { error "Import verification failed. Check output above."; exit 1; }
+if (cd /tmp && python -c "import rdkit, dd_prep, pandas, yaml") 2>/dev/null; then
+    success "Imports verified (rdkit, dd_prep, pandas, yaml)."
+else
+    error "Import verification failed."
+    (cd /tmp && python -c "import rdkit, dd_prep, pandas, yaml") 2>&1 | tail -5 | sed 's/^/    /'
+    VERIFY_FAILED=true
+fi
+
+if command -v dd-prep >/dev/null 2>&1; then
+    success "Console script found: $(command -v dd-prep)"
+else
+    error "The 'dd-prep' command is not on PATH after installation."
+    echo "    The SLURM scripts call 'dd-prep' directly, so jobs would fail"
+    echo "    at startup with 'command not found' (exit code 127)."
+    echo "    Workaround: use 'python -m dd_prep.cli' instead."
+    VERIFY_FAILED=true
+fi
+
+if [ "$VERIFY_FAILED" = true ]; then
+    error "Setup incomplete. Resolve the above before submitting jobs."
+    exit 1
+fi
 
 # ── Step 5: OpenEye ───────────────────────────────────────────────────────────
 echo ""

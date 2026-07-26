@@ -32,6 +32,10 @@ VENV_DIR="${DD_PREP_VENV:?Set DD_PREP_VENV or run setup_cluster.sh}"
 module purge
 module load StdEnv/2023
 module load python/3.11
+# scipy-stack supplies pandas/numpy from CVMFS. On Alliance pip is
+# pointed at a local wheelhouse, and pandas is expected to
+# come from this module.
+module load scipy-stack
 module load gcc rdkit
 
 source "$VENV_DIR/bin/activate"
