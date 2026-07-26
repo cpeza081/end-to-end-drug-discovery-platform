@@ -262,6 +262,7 @@ class Pipeline:
         ctx.set("dry_run",    self.config.dry_run)
         ctx.set("resume",     self.config.resume)
         ctx.set("cleanup_intermediates", self.config.cleanup_intermediates)
+        ctx.set("filter_enabled", self.config.filter.enabled)
         return ctx
 
     def _repopulate_context(

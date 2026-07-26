@@ -201,7 +201,9 @@ class FilterStep(PipelineStep):
 
                     for chunk_idx, chunk in enumerate(reader):
                         # Standardise column names
-                        chunk.columns = [str(c).strip().lower() for c in chunk.columns]
+                        # Renamed by the exact names _detect_format returned,
+                        # which are pandas' own. Do NOT normalise the columns
+                        # first -- lowercasing them is what broke the mapping.
                         chunk = chunk.rename(
                             columns={smiles_col: "smiles", id_col: "idnumber"}
                         ).fillna("")
@@ -364,33 +366,43 @@ class FilterStep(PipelineStep):
         else:
             sep = "\t"  # safe fallback -- better than a regex
  
-        # Split header into column names using any whitespace/delimiter
-        import re
-        cols = [c.strip().lower()
-                for c in re.split(r"[\t, ]+", first_line)]
- 
+        # Ask pandas for the column names
+        header_cols = list(
+            pd.read_csv(path, sep=sep, engine="python",
+                        skipinitialspace=True, nrows=0).columns
+        )
+        if len(header_cols) < 2:
+            raise ValueError(
+                f"{path} has fewer than two columns; expected SMILES and an ID."
+            )
+
+        # Matching is case-insensitive
+        lowered = [str(c).strip().lower() for c in header_cols]
+
         smiles_names = {"smiles", "smi", "smile", "canonical_smiles"}
         id_names     = {"id", "idnumber", "name", "molecule_name",
                         "chembl_id", "zinc_id", "molid"}
- 
-        # Try to identify columns by name
-        smiles_col = next((c for c in cols if c in smiles_names), None)
-        id_col     = next((c for c in cols if c in id_names), None)
- 
-        if smiles_col and id_col:
-            return sep, smiles_col, id_col
-        
-        if second_line:
-            data_cols = re.split(r"[\t, ]+", second_line)
-            if len(data_cols) >= 2:
-                smi_idx, id_idx = FilterStep._pick_columns(data_cols)
-                # Guard against a header row with fewer names than the data
-                # row has fields (ragged file). fall back to positional names.
-                if max(smi_idx, id_idx) < len(cols):
-                    return sep, cols[smi_idx], cols[id_idx]
 
-        # Last resort: assume first two columns are smiles, id
-        return sep, cols[0], cols[1]
+        smiles_idx = next((i for i, c in enumerate(lowered) if c in smiles_names), None)
+        id_idx     = next((i for i, c in enumerate(lowered) if c in id_names), None)
+
+        if smiles_idx is not None and id_idx is not None:
+            return sep, header_cols[smiles_idx], header_cols[id_idx]
+
+        # ---- Header present, but with unrecognised column names -------------
+        # Identify the columns from a data row.
+        if second_line:
+            import re
+            data_cols = (re.split(r"[\t, ]+", second_line)
+                         if sep == " " else second_line.split(sep))
+            if len(data_cols) >= 2:
+                smi_i, id_i = FilterStep._pick_columns(data_cols)
+                # A ragged file can have more data fields than header names.
+                if max(smi_i, id_i) < len(header_cols):
+                    return sep, header_cols[smi_i], header_cols[id_i]
+
+        # Last resort: assume the first two columns are smiles, id
+        return sep, header_cols[0], header_cols[1]
 
     @staticmethod
     def _pick_columns(fields: list[str]) -> tuple[int, int]:

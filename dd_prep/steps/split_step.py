@@ -55,6 +55,8 @@ class SplitStep(PipelineStep):
         if filter_file:
             if not Path(filter_file).is_file():
                 errors.append(f"Source file not found: '{filter_file}'.")
+        elif ctx.get("filter_enabled", False):
+            pass
         else:
             raw_inputs = ctx.get("input_files") or []
             if isinstance(raw_inputs, (str, Path)):
