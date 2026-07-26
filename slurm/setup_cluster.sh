@@ -302,9 +302,8 @@ pip_run() {
 }
 
 pip_run "Upgrading pip..."        install --upgrade pip
-# pandas and numpy come from the scipy-stack module.
 pip_run "Installing dependencies (pyyaml, tqdm)..." install pyyaml tqdm
-pip_run "Installing dd_prep..."   install "$PROJECT_DIR" --force-reinstall
+pip_run "Installing dd_prep..."   install "$PROJECT_DIR" --force-reinstall --no-deps
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 # We have two checks.
@@ -317,11 +316,12 @@ pip_run "Installing dd_prep..."   install "$PROJECT_DIR" --force-reinstall
 #      run and it is invisible to an import check.
 VERIFY_FAILED=false
 
-if (cd /tmp && python -c "import rdkit, dd_prep, pandas, yaml") 2>/dev/null; then
-    success "Imports verified (rdkit, dd_prep, pandas, yaml)."
+DD_PREP_IMPORTS="rdkit, pandas, yaml, tqdm, dd_prep"
+if (cd /tmp && python -c "import $DD_PREP_IMPORTS") 2>/dev/null; then
+    success "Imports verified ($DD_PREP_IMPORTS)."
 else
     error "Import verification failed."
-    (cd /tmp && python -c "import rdkit, dd_prep, pandas, yaml") 2>&1 | tail -5 | sed 's/^/    /'
+    (cd /tmp && python -c "import $DD_PREP_IMPORTS") 2>&1 | tail -5 | sed 's/^/    /'
     VERIFY_FAILED=true
 fi
 
