@@ -103,10 +103,10 @@ success "Using account: $SLURM_ACCOUNT"
 #
 # INPUT_YAML ends up holding the value written into the config, already in
 # YAML form (either a quoted scalar or a flow sequence).
-ask "Path to your input SMILES library.
-  One file:      /project/lib/library.smi
-  Several files: /project/lib/part1.smi /project/lib/part2.smi
-  Or a glob:     /project/lib/part*.smi"
+ask "Path to your input SMILES library:"
+echo "    One file:      /project/lib/library.smi"
+echo "    Several files: /project/lib/part1.smi /project/lib/part2.smi"
+echo "    Or a glob:     /project/lib/part*.smi"
 read -r INPUT_RAW
 
 # Expand the answer into an array. Unquoted so both space separation and
@@ -407,7 +407,15 @@ fi
 
 # ── Step 6: Update SLURM scripts ─────────────────────────────────────────────
 info "Updating SLURM scripts..."
+# Skip this script. Bash reads a script incrementally by byte offset, so
+# rewriting it while it is still executing can shift those offsets and make
+# bash resume mid-token -- producing a syntax error on a line that is
+# perfectly valid, somewhere after this loop. setup_cluster.sh has no
+# #SBATCH --account line to update anyway.
+SELF_NAME="$(basename "${BASH_SOURCE[0]}")"
+
 for f in "$SCRIPT_DIR"/*.sh; do
+    [ "$(basename "$f")" = "$SELF_NAME" ] && continue
     sed -i 's/\r//' "$f"
     sed -i "s|#SBATCH --account=.*|#SBATCH --account=$SLURM_ACCOUNT|g" "$f"
     [ -n "$OE_LIC" ] && sed -i "s|export OE_LICENSE=.*|export OE_LICENSE=\"$OE_LIC\"|g" "$f"
