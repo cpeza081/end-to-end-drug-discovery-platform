@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dd_filter_split
-#SBATCH --time=24:00:00          # Filter is the throughput bottleneck. RDKit
+#SBATCH --time=1:00:00          # Filter is the throughput bottleneck. RDKit
                                  # parse + descriptors runs at a few thousand
                                  # mol/s PER CORE, so even parallelised across
                                  # 32 cores a ~1B molecule library is many hours.
