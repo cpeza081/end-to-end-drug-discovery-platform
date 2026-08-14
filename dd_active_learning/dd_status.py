@@ -182,10 +182,14 @@ def render_dashboard(cfg: dict, state: dict, query_scheduler: bool):
         print(f"\n  Iteration {it:2d}")
         print(f"  {'-'*55}")
 
-        # Phases 1-3 are single jobs. Phase 4 is three steps (4a labels+gen,
-        # 4b training array, 4c evaluate). Phase 5 is two steps (5a gen, 5b array).
+        # Phases 1-2 are single jobs. Phase 3 is three steps (3a shard,
+        # 3b docking array, 3c merge). Phase 4 is three steps (4a labels+gen,
+        # 4b training array, 4c evaluate). Phase 5 is two (5a gen, 5b array).
         phase_rows = [(str(p), PHASE_NAMES[p], f"phase{p}_job_id")
-                      for p in (1, 2, 3)]
+                      for p in (1, 2)]
+        phase_rows.append(("3a", "Shard SDFs",  "phase3a_job_id"))
+        phase_rows.append(("3b", "Dock array",  "phase3b_job_id"))
+        phase_rows.append(("3c", "Merge docked","phase3c_job_id"))
         phase_rows.append(("4a", "Labels+gen",  "phase4a_job_id"))
         phase_rows.append(("4b", "Train array", "phase4b_job_id"))
         phase_rows.append(("4c", "Best model",  "phase4c_job_id"))

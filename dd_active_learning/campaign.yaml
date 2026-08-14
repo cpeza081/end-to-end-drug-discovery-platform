@@ -49,6 +49,17 @@ docking:
     #   center: [11.5, -3.25, 7.0]   # box center x, y, z (A)
     #   size:   [24, 24, 24]         # box size x, y, z (A)
 
+  # -- Docking parallelism -----------------------------------------------------
+  # Phase 3 splits the prepared ligands into shards of this many molecules and
+  # docks one shard per SLURM array task. This is the main lever on Phase 3
+  # wall-clock: a smaller number means more, shorter tasks running in parallel.
+  #
+  # Concurrency is capped by scheduler.array_throttle, so the GPU-hours consumed
+  # are unchanged -- only how many run at once. Size it so one shard finishes
+  # comfortably inside scheduler.walltime.phase3_docking; a task that overruns
+  # is killed and its shard has to be redone.
+  molecules_per_docking_job: 10000
+
   # -- Gnina-specific options --------------------------------------------------
   gnina_cnn: "rescore"        # none | rescore | refinement | all
   exhaustiveness: 8
@@ -106,7 +117,9 @@ scheduler:
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"
-    phase3_docking: "24:00:00"
+    phase3a_split: "01:00:00"     # split the prepared SDFs into shards (CPU)
+    phase3_docking: "12:00:00"    # PER ARRAY TASK (one shard)
+    phase3c_merge: "01:00:00"     # concatenate docked shards back per set (CPU)
     phase4a_labels: "01:00:00"    # extract labels + generate model scripts (CPU)
     phase4_training: "12:00:00"   # per model (one training-array task)
     phase4c_eval: "02:00:00"      # grid-search / pick best model (CPU)
@@ -121,7 +134,9 @@ scheduler:
   resources:
     phase1_sampling:  {nodes: 1, cpus: 60,  mem: "48G",  gpus: 0}
     phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G",  gpus: 0}
-    phase3_docking:   {nodes: 1, cpus: 6,   mem: "48G",  gpus: 1}   # GPU: Gnina / AutoDock-GPU
+    phase3a_split:    {nodes: 1, cpus: 4,   mem: "16G",  gpus: 0}   # CPU: shard the SDFs
+    phase3_docking:   {nodes: 1, cpus: 6,   mem: "48G",  gpus: 1}   # GPU: per array task (one shard)
+    phase3c_merge:    {nodes: 1, cpus: 4,   mem: "16G",  gpus: 0}   # CPU: concatenate shards
     phase4a_labels:   {nodes: 1, cpus: 8,   mem: "16G",  gpus: 0}   # CPU: labels + script gen
     phase4_training:  {nodes: 1, cpus: 6,   mem: "32G",  gpus: 1}   # GPU: per model (array task)
     phase4c_eval:     {nodes: 1, cpus: 8,   mem: "32G",  gpus: 0}   # CPU: evaluate + pick best

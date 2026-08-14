@@ -637,10 +637,151 @@ class JobScriptFactory:
     # ------------------------------------------------------------------
     # Phase 3: Docking
     # ------------------------------------------------------------------
-    def phase3_docking(self, iteration: int) -> str:
-        job_name = f"{self.name}_i{iteration:02d}_p3_docking"
-        # Gnina and AutoDock-GPU are both GPU-accelerated -> gpu_partition.
-        header   = self._make_header("phase3_docking", job_name, "gpu_partition")
+    # ---- Phase 3: shard, dock array, merge --------------------------------
+    #
+    # Docking is the dominant cost of a campaign, so it runs as a job array:
+    # 3a splits the prepared ligands into fixed-size shards, 3b docks one shard
+    # per array task, 3c concatenates the results back together.
+
+    _SHARD_DIR  = "sdf_shards"
+    _DOCKED_DIR = "docked_shards"
+
+    def _shard_count(self, iteration: int) -> int:
+        """How many array tasks Phase 3b needs.
+
+        The array size has to be fixed when the job is submitted, but the exact
+        molecule count is only known once 3a has run. So it is computed from the
+        configured sample sizes and rounded up, with a margin: ligand prep drops
+        a few molecules that fail 3-D embedding, but nothing can ever produce
+        more than was sampled, so over-provisioning is the safe direction.
+        Surplus tasks find no shard file and exit 0 without doing anything.
+        """
+        dd = self.cfg["dd"]
+        per_job = int(self.cfg["docking"].get("molecules_per_docking_job", 10000))
+        if per_job < 1:
+            raise ValueError("docking.molecules_per_docking_job must be >= 1")
+        # Iteration 1 samples train + validation + test; later iterations only
+        # draw a fresh training batch.
+        if iteration == 1:
+            total = int(dd["train_size"]) + 2 * int(dd["val_size"])
+        else:
+            total = int(dd["train_size"])
+        return max(1, -(-total // per_job))     # ceiling division
+
+    # The two helper programs below are plain strings not f-strings. They are
+    # Python source embedded in a heredoc, and f-string interpolation would eat
+    # every {name} and {idx:05d} in them.
+    _SPLIT_PY = r"""
+import os, sys
+
+shard_dir, per_job = sys.argv[1], int(sys.argv[2])
+inputs = sys.argv[3:]
+total_shards = 0
+
+for path in inputs:
+    base = os.path.basename(path)[:-4]        # strip ".sdf"
+    n_mol = shard_idx = 0
+    out = None
+    # SDF records end with a line that is exactly "$$$$". Splitting on that
+    # boundary keeps every record intact; splitting on byte offsets or line
+    # counts would cut molecules in half.
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            if out is None:
+                shard_idx += 1
+                total_shards += 1
+                out = open(os.path.join(
+                    shard_dir, "%s__%05d.sdf" % (base, shard_idx)), "w")
+            out.write(line)
+            if line.rstrip("\n").rstrip("\r") == "$$$$":
+                n_mol += 1
+                if n_mol % per_job == 0:
+                    out.close()
+                    out = None
+    if out is not None:
+        out.close()
+    print("  %s: %d molecules -> %d shard(s)" % (base, n_mol, shard_idx),
+          flush=True)
+
+print("TOTAL_SHARDS=%d" % total_shards)
+with open(os.path.join(shard_dir, ".n_shards"), "w") as fh:
+    fh.write(str(total_shards))
+"""
+
+    _MERGE_PY = r"""
+import os, re, sys
+from collections import defaultdict
+
+shard_out, docked = sys.argv[1], sys.argv[2]
+groups = defaultdict(list)
+pat = re.compile(r"^(?P<base>.+)__(?P<idx>[0-9]{5})_docked\.sdf$")
+
+for name in os.listdir(shard_out):
+    m = pat.match(name)
+    if m:
+        groups[m.group("base")].append((int(m.group("idx")), name))
+
+if not groups:
+    sys.exit("ERROR: no docked shards found in %s" % shard_out)
+
+for base, items in sorted(groups.items()):
+    items.sort()                       # shard order, so output is deterministic
+    out_path = os.path.join(docked, "%s_docked.sdf" % base)
+    n_mol = 0
+    with open(out_path, "w") as out:
+        for _, name in items:
+            with open(os.path.join(shard_out, name), "r", errors="replace") as fh:
+                for line in fh:
+                    out.write(line)
+                    if line.rstrip("\n").rstrip("\r") == "$$$$":
+                        n_mol += 1
+    print("  %s: %d shard(s) -> %d molecules" % (base, len(items), n_mol),
+          flush=True)
+
+print("MERGED_SETS=%d" % len(groups))
+"""
+
+    def phase3a_split(self, iteration: int) -> str:
+        job_name = f"{self.name}_i{iteration:02d}_p3a_split"
+        header   = self._make_header("phase3a_split", job_name, "cpu_partition")
+        per_job  = int(self.cfg["docking"].get("molecules_per_docking_job", 10000))
+
+        body = textwrap.dedent(f"""\
+
+            # -- Phase 3a: split prepared ligands into shards (iteration {iteration}) --
+            # Each input SDF becomes <base>__NNNNN.sdf shards of {per_job}
+            # molecules. The base name is preserved so 3c can group shards back
+            # by set (train / valid / test).
+
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            SHARD_DIR="$ITER_DIR/{self._SHARD_DIR}"
+            rm -rf "$SHARD_DIR"
+            mkdir -p "$SHARD_DIR"
+
+            SDF_FILES=("$ITER_DIR/sdf/"*.sdf)
+            if [ ! -e "${{SDF_FILES[0]}}" ]; then
+                echo "ERROR: no .sdf files in $ITER_DIR/sdf/ - Phase 2 output missing" >&2
+                exit 1
+            fi
+
+            python - "$SHARD_DIR" {per_job} "${{SDF_FILES[@]}}" <<'PYSPLIT'
+{self._SPLIT_PY}
+PYSPLIT
+
+            N=$(cat "$SHARD_DIR/.n_shards")
+            echo "[$(date)] Phase 3a complete - $N shard(s) written to $SHARD_DIR"
+            if [ "$N" -eq 0 ]; then
+                echo "ERROR: splitting produced no shards" >&2
+                exit 1
+            fi
+        """)
+        return header + self._preamble(iteration) + body
+
+    def phase3b_array(self, iteration: int) -> str:
+        """One array task per shard. SLURM_ARRAY_TASK_ID selects the shard."""
+        job_name = f"{self.name}_i{iteration:02d}_p3b_dock"
+        header   = self._make_header("phase3_docking", job_name, "gpu_partition",
+                                     array_log=True)
         program  = _docking_program(self.cfg)
         dock     = self.cfg["docking"]
 
@@ -651,60 +792,133 @@ class JobScriptFactory:
 
         body = textwrap.dedent(f"""\
 
-            # -- Phase 3: Molecular docking (iteration {iteration}) ---------
-            # Docks the sampled molecules (training + val + test in iter 1,
-            # training augmentation only in later iterations).
-            # Outputs one SDF file per input set inside the "docked" folder.
-            # The SDF must contain the docking score field used in Phase 4.
+            # -- Phase 3b: dock one shard (iteration {iteration}) ---------------
+            # Array task N docks the Nth shard. The array is sized from the
+            # configured sample sizes, so it may be slightly larger than the
+            # number of shards that actually exist. Surplus tasks exit 0.
 
             ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
-            mkdir -p "$ITER_DIR/docked"
+            SHARD_DIR="$ITER_DIR/{self._SHARD_DIR}"
+            OUT_DIR="$ITER_DIR/{self._DOCKED_DIR}"
+            mkdir -p "$OUT_DIR"
 
+            mapfile -t SHARDS < <(ls -1 "$SHARD_DIR"/*.sdf 2>/dev/null | sort)
+            IDX=$((SLURM_ARRAY_TASK_ID - 1))
+
+            if [ "$IDX" -ge "${{#SHARDS[@]}}" ]; then
+                echo "No shard for array index $SLURM_ARRAY_TASK_ID " \
+                     "(${{#SHARDS[@]}} shards exist) - nothing to do."
+                exit 0
+            fi
+
+            SDF_FILE="${{SHARDS[$IDX]}}"
+            BASE=$(basename "$SDF_FILE" .sdf)
+            OUT_FILE="$OUT_DIR/${{BASE}}_docked.sdf"
+
+            # Resume: a completed shard is left alone, so a resubmitted array
+            # only redoes the tasks that did not finish.
+            if [ -s "$OUT_FILE" ]; then
+                echo "$OUT_FILE already present - skipping."
+                exit 0
+            fi
+
+            echo "[$(date)] Docking shard $SLURM_ARRAY_TASK_ID: $BASE"
         """) + docking_cmd + textwrap.dedent(f"""\
 
-            echo "[$(date)] Phase 3 complete - iteration {iteration}"
+            echo "[$(date)] Phase 3b task $SLURM_ARRAY_TASK_ID complete"
         """)
 
         return header + self._preamble(iteration, gpu=True) + body
 
+    def phase3c_merge(self, iteration: int) -> str:
+        """Concatenate docked shards back into one SDF per sampled set.
+
+        Restores the filenames Phase 4a expects, so extract_labels.py sees the
+        same layout it would have from a single-job Phase 3.
+        """
+        job_name = f"{self.name}_i{iteration:02d}_p3c_merge"
+        header   = self._make_header("phase3c_merge", job_name, "cpu_partition")
+        n_expect = 3 if iteration == 1 else 1
+
+        body = textwrap.dedent(f"""\
+
+            # -- Phase 3c: merge docked shards (iteration {iteration}) ----------
+            # Shards are named <base>__NNNNN_docked.sdf; grouping on the "__"
+            # separator reassembles each set into <base>_docked.sdf.
+
+            ITER_DIR="{self.proj}/{self.name}/iteration_{iteration}"
+            SHARD_OUT="$ITER_DIR/{self._DOCKED_DIR}"
+            DOCKED="$ITER_DIR/docked"
+            mkdir -p "$DOCKED"
+
+            python - "$SHARD_OUT" "$DOCKED" <<'PYMERGE'
+{self._MERGE_PY}
+PYMERGE
+
+            NFILES=$(ls -1 "$DOCKED"/*_docked.sdf 2>/dev/null | wc -l)
+            echo "[$(date)] Phase 3c complete. $NFILES merged file(s) in $DOCKED"
+
+            # Phase 4a passes --tot_process {n_expect}, so a mismatch here means
+            # label extraction would read the wrong number of sets.
+            if [ "$NFILES" -ne {n_expect} ]; then
+                echo "ERROR: expected {n_expect} merged docked file(s), found $NFILES" >&2
+                exit 1
+            fi
+        """)
+        return header + self._preamble(iteration) + body
+
     def _gnina_docking_cmd(self, dock: dict) -> str:
-        """Gnina docking: one multi-molecule SDF per chunk, into the explicit
-        box derived once by dd_receptor_prep.py (receptor_box.json).  Gnina uses
-        the GPU for CNN pose scoring.  The box is then read at runtime."""
+        """Dock one shard ($SDF_FILE -> $OUT_FILE) into the pre-computed box.
+
+        Both variables are set by the Phase 3b array wrapper. The box is read at
+        runtime from receptor_box.json, which dd_receptor_prep.py wrote once.
+        """
         receptor = dock["receptor_file"]
         box_json = dock["box_json"]
         cnn      = dock.get("gnina_cnn", "rescore")
         exhaust  = dock.get("exhaustiveness", 8)
+        # Give gnina the cores the job actually reserved. Without --cpu it uses
+        # its own default thread count, which may be fewer than allocated.
+        ncpu = self.cfg["scheduler"]["resources"].get(
+            "phase3_docking", self._DEFAULT_RES)["cpus"]
         return textwrap.dedent(f"""\
             # Read the pre-computed binding box (center/size) once.
             BOX=$(python -c "import json; d=json.load(open('{box_json}')); \\
 c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             read CX CY CZ SX SY SZ <<< "$BOX"
 
-            # Dock each prepared SDF chunk with Gnina into that box.
-            SDF_FILES=("$ITER_DIR/sdf/"*.sdf)
-            if [ ${{#SDF_FILES[@]}} -eq 0 ]; then
-                echo "ERROR: no .sdf files in $ITER_DIR/sdf/ - Phase 2 output missing" >&2
-                exit 1
-            fi
-            for SDF_FILE in "${{SDF_FILES[@]}}"; do
-                BASE=$(basename "$SDF_FILE" .sdf)
-                gnina \\
-                    --receptor "{receptor}" \\
-                    --ligand "$SDF_FILE" \\
-                    --center_x "$CX" --center_y "$CY" --center_z "$CZ" \\
-                    --size_x "$SX" --size_y "$SY" --size_z "$SZ" \\
-                    --cnn_scoring {cnn} \\
-                    --exhaustiveness {exhaust} \\
-                    --seed 0 \\
-                    --out "$ITER_DIR/docked/${{BASE}}_docked.sdf"
-            done
+            # Write to a temporary file and move it into place only on success.
+            # The resume check in the array wrapper treats a non-empty output as
+            # a finished shard, so a partial file from a killed task would
+            # otherwise be mistaken for completed work.
+            TMP_OUT="${{OUT_FILE}}.partial"
+            rm -f "$TMP_OUT"
+
+            gnina \\
+                --receptor "{receptor}" \\
+                --ligand "$SDF_FILE" \\
+                --center_x "$CX" --center_y "$CY" --center_z "$CZ" \\
+                --size_x "$SX" --size_y "$SY" --size_z "$SZ" \\
+                --cnn_scoring {cnn} \\
+                --exhaustiveness {exhaust} \\
+                --cpu {ncpu} \\
+                --seed 0 \\
+                --out "$TMP_OUT"
+
+            mv "$TMP_OUT" "$OUT_FILE"
         """)
 
     def _autodock_docking_cmd(self, dock: dict) -> str:
         """AutoDock-GPU docking: batch each chunk's per-molecule PDBQTs against
         the pre-computed grid maps, then export each chunk's .dlg results into a
-        single scored SDF for Phase 4."""
+        single scored SDF for Phase 4.
+
+        NOTE: Phase 3 now shards the prepared ligands and docks one shard per
+        array task, but that sharding operates on SDF records. AutoDock-GPU
+        consumes a directory of per-molecule PDBQT files instead, so it needs
+        its own sharding scheme (by chunk directory) that has not been written
+        yet. _submit_phase3 rejects AUTODOCK_GPU rather than generating a script
+        that would silently dock the wrong thing."""
         maps_fld = dock["maps_fld"]
         adbin    = dock.get("autodock_bin", "autodock_gpu_128wi")
         nrun     = dock.get("autodock_nrun", 10)
@@ -1092,6 +1306,46 @@ class DDOrchestrator:
         except OSError:
             return 0
 
+    def _submit_phase3(self, iteration: int, depends_on: str | None,
+                       throttle: int, resume: bool = False) -> str:
+        """Submit Phase 3 as three chained jobs: 3a shards the prepared ligands,
+        3b docks one shard per array task, 3c merges the results back into the
+        per-set docked SDFs Phase 4a expects. Returns the 3c job ID.
+
+        Resume handling follows _submit_phase4/_submit_phase5: a sub-step that
+        already COMPLETED is skipped, and the next step must not afterok-depend
+        on a job that may have been purged, so it depends on None instead.
+        Its inputs are already on disk.
+        """
+        program = _docking_program(self.cfg)
+        if program != "GNINA":
+            raise SystemExit(
+                f"ERROR: Phase 3 array docking is implemented for GNINA only. "
+                f"docking.program is {program}. AutoDock-GPU consumes per-molecule "
+                f"PDBQT directories rather than SDF records and needs its own "
+                f"sharding scheme."
+            )
+
+        n_shards = self.factory._shard_count(iteration)
+        per_job = self.cfg["docking"].get("molecules_per_docking_job", 10000)
+        print(f"  Phase 3: Docking  (split + array over ~{n_shards} shards of "
+              f"{per_job} molecules, <= {throttle} concurrent tasks) + merge")
+
+        a_already = self.state.is_phase_submitted(iteration, "3a")
+        split_id = self._submit_phase(iteration, "3a",
+                                      self.factory.phase3a_split(iteration),
+                                      depends_on)
+
+        b_already = self.state.is_phase_submitted(iteration, "3b")
+        b_dep = None if (resume and a_already) else split_id
+        arr_id = self._submit_phase(iteration, "3b",
+                                    self.factory.phase3b_array(iteration),
+                                    b_dep, array=f"1-{n_shards}%{throttle}")
+
+        c_dep = None if (resume and b_already) else arr_id
+        return self._submit_phase(iteration, "3c",
+                                  self.factory.phase3c_merge(iteration), c_dep)
+
     def _submit_phase5(self, iteration: int, depends_on: str | None,
                        n_chunks: int, throttle: int, resume: bool = False) -> str:
         """Submit Phase 5 as two chained jobs. 5a generates one inference script
@@ -1172,7 +1426,8 @@ class DDOrchestrator:
         """
         order: list[tuple] = []
         for it in range(1, self.total_iter + 1):
-            for ph in (1, 2, 3, "4a", "4b", "4c", "5a", "5b"):
+            for ph in (1, 2, "3a", "3b", "3c",
+                       "4a", "4b", "4c", "5a", "5b"):
                 order.append((it, ph))
         order.append(("final", "final"))
 
@@ -1207,6 +1462,8 @@ class DDOrchestrator:
         it, ph = order[resume_idx]
         if ph == "final":
             return (self.total_iter + 1, 1)     # loop is empty; only final runs
+        if ph in ("3a", "3b", "3c"):
+            return (it, 3)
         if ph in ("4a", "4b", "4c"):
             return (it, 4)
         if ph in ("5a", "5b"):
@@ -1278,19 +1535,17 @@ class DDOrchestrator:
                   f"rejected, prepare the library into fewer/larger fingerprint "
                   f"chunk files, or ask the admins to raise MaxArraySize.\n")
 
-        # Phases 1-3 are single jobs. Phase 4 expands to 4a (generate) + 4b
-        # (training array) + 4c (evaluate). Phase 5 expands to 5a (generate) + 5b
-        # (inference array). Both multi-step phases have their own submitters.
-        phase_methods = {
-            2: self.factory.phase2_ligand_prep,
-            3: self.factory.phase3_docking,
-        }
+        # Phases 1 and 2 are single jobs. Phases 3, 4 and 5 each expand into a
+        # generate/array/collect trio and have their own submitters:
+        #   3 -> 3a (shard)    + 3b (docking array)   + 3c (merge)
+        #   4 -> 4a (labels)   + 4b (training array)  + 4c (evaluate)
+        #   5 -> 5a (pred-gen) + 5b (inference array)
 
         for iteration in range(start_iter, self.total_iter + 1):
             print(f"-- Iteration {iteration} ------------------------------")
             phase_start = start_phase if iteration == start_iter else 1
 
-            for phase_num in (1, 2, 3):
+            for phase_num in (1, 2):
                 if phase_num < phase_start:
                     continue
                 print(f"  Phase {phase_num}: {PHASES[phase_num]}")
@@ -1298,9 +1553,15 @@ class DDOrchestrator:
                     # Phase 1 walltime scales with the library chunk count.
                     script = self.factory.phase1_sampling(iteration, n_chunks)
                 else:
-                    script = phase_methods[phase_num](iteration)
+                    script = self.factory.phase2_ligand_prep(iteration)
                 last_job_id = self._submit_phase(
                     iteration, phase_num, script, last_job_id
+                )
+
+            # Phase 3: shard + docking array + merge.
+            if phase_start <= 3:
+                last_job_id = self._submit_phase3(
+                    iteration, last_job_id, throttle, resume=resume_mode
                 )
 
             # Phase 4: labels + training array + evaluation.

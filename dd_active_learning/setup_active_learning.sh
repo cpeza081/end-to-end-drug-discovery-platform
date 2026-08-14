@@ -312,8 +312,21 @@ fi
 # --- Engine-specific defaults ---
 if [ "$DOCK_PROGRAM" = "GNINA" ]; then
     GNINA_CNN="rescore"; EXHAUST="8"
+
+    # Docking runs as a SLURM job array: the prepared ligands are split into
+    # shards of this size and one array task docks each shard. This is the main
+    # lever on Phase 3 wall-clock. Smaller shards = more, shorter tasks that
+    # backfill more easily; total GPU-hours are unchanged.
+    echo ""
+    echo "  Docking is parallelised as a job array, one task per shard of"
+    echo "  molecules. Pick a shard size that finishes comfortably inside the"
+    echo "  per-task walltime -- a task that overruns is killed and redone."
+    prompt_default "Molecules per docking job" "10000"; MOLS_PER_DOCK="$REPLY_VAL"
 else
     AUTODOCK_BIN="autodock_gpu_128wi"; AUTODOCK_NRUN="10"
+    # Not used by the AutoDock path (which is not sharded), but the key must
+    # exist so the config schema is uniform across engines.
+    MOLS_PER_DOCK="10000"
 fi
 
 # =============================================================================
@@ -591,6 +604,14 @@ docking:
   receptor_file: "$RECEPTOR_FILE"
   box_json: "$BOX_JSON"                 # produced by dd_receptor_prep.py
   score_keyword: "$SCORE_KEYWORD"
+
+  # Phase 3 splits the prepared ligands into shards of this size and docks one
+  # shard per SLURM array task. Main lever on Phase 3 wall-clock: smaller shards
+  # mean more, shorter tasks. Total GPU-hours are unchanged; concurrency is
+  # capped by scheduler.array_throttle. Size it so one shard finishes inside
+  # scheduler.walltime.phase3_docking -- an overrunning task is killed and redone.
+  molecules_per_docking_job: $MOLS_PER_DOCK
+
   site:
 $SITE_YAML
 $ENGINE_YAML
@@ -623,13 +644,17 @@ scheduler:
   # caps concurrent tasks (each uses one GPU).
   array_throttle: 10
 
-  # phase1_sampling walltime auto-scales up with the fingerprint-chunk count
-  # (a floor). phase4_training is per model (one array task; DD: <= ~12h/model).
-  # phase5_inference is per inference task (one chunk).
+  # Several of these are PER ARRAY TASK, not per phase:
+  #   phase3_docking   -> one shard of molecules_per_docking_job molecules
+  #   phase4_training  -> one model (DD: <= ~12h/model)
+  #   phase5_inference -> one fingerprint chunk
+  # phase1_sampling auto-scales up with the fingerprint-chunk count (a floor).
   walltime:
     phase1_sampling: "00:30:00"
     phase2_ligand_prep: "08:00:00"
-    phase3_docking: "24:00:00"
+    phase3a_split: "01:00:00"
+    phase3_docking: "12:00:00"    # PER ARRAY TASK (one shard), not the whole phase
+    phase3c_merge: "01:00:00"
     phase4a_labels: "01:00:00"
     phase4_training: "12:00:00"
     phase4c_eval: "02:00:00"
@@ -642,7 +667,9 @@ scheduler:
   resources:
     phase1_sampling:  {nodes: 1, cpus: 60, mem: "48G", gpus: 0}
     phase2_ligand_prep: {nodes: 3, cpus: 60, mem: "32G", gpus: 0}
+    phase3a_split:    {nodes: 1, cpus: 4,  mem: "16G", gpus: 0}
     phase3_docking:   {nodes: 1, cpus: 6,  mem: "48G", gpus: 1}
+    phase3c_merge:    {nodes: 1, cpus: 4,  mem: "16G", gpus: 0}
     phase4a_labels:   {nodes: 1, cpus: 8,  mem: "16G", gpus: 0}
     phase4_training:  {nodes: 1, cpus: 6,  mem: "32G", gpus: 1}
     phase4c_eval:     {nodes: 1, cpus: 8,  mem: "32G", gpus: 0}
