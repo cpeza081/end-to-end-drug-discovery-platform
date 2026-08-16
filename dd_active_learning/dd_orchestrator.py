@@ -891,7 +891,11 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
             # The resume check in the array wrapper treats a non-empty output as
             # a finished shard, so a partial file from a killed task would
             # otherwise be mistaken for completed work.
-            TMP_OUT="${{OUT_FILE}}.partial"
+            #
+            # The staged name must keep the .sdf extension. gnina picks its
+            # output format from the extension, and anything it does not
+            # recognise makes it discard every docked pose while still appearing to run.
+            TMP_OUT="${{OUT_FILE%.sdf}}.partial.sdf"
             rm -f "$TMP_OUT"
 
             gnina \\
