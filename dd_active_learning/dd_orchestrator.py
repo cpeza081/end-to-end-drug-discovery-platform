@@ -905,8 +905,10 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
                 --size_x "$SX" --size_y "$SY" --size_z "$SZ" \\
                 --cnn_scoring {cnn} \\
                 --exhaustiveness {exhaust} \\
+                --num_modes 1 \\
                 --cpu {ncpu} \\
-                --seed 0 \\
+                --seed 42 \\
+                --quiet \\
                 --out "$TMP_OUT"
 
             mv "$TMP_OUT" "$OUT_FILE"
