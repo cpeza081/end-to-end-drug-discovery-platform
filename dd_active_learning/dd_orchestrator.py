@@ -287,7 +287,7 @@ class Scheduler:
                 #SBATCH --time={walltime}
                 #SBATCH --output={log_dir}/{job_name}_{slurm_tag}.out
                 #SBATCH --error={log_dir}/{job_name}_{slurm_tag}.err
-                {part_line}{gpu_line}{excl_line}""")
+                """) + part_line + gpu_line + excl_line
 
         if self.stype == "PBS":
             return textwrap.dedent(f"""\
@@ -299,7 +299,7 @@ class Scheduler:
                 #PBS -l walltime={walltime}
                 #PBS -o {log_dir}/{job_name}.out
                 #PBS -e {log_dir}/{job_name}.err
-                {part_line}{gpu_line}""")
+                """) + part_line + gpu_line
 
         # SGE
         return textwrap.dedent(f"""\
@@ -311,7 +311,7 @@ class Scheduler:
             #$ -l h_rt={walltime}
             #$ -o {log_dir}/{job_name}.out
             #$ -e {log_dir}/{job_name}.err
-            {part_line}{gpu_line}""")
+            """) + part_line + gpu_line
 
 
 # =============================================================================
