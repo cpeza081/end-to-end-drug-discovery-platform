@@ -660,13 +660,13 @@ class JobScriptFactory:
         per_job = int(self.cfg["docking"].get("molecules_per_docking_job", 10000))
         if per_job < 1:
             raise ValueError("docking.molecules_per_docking_job must be >= 1")
-        # Iteration 1 samples train + validation + test; later iterations only
-        # draw a fresh training batch.
-        if iteration == 1:
-            total = int(dd["train_size"]) + 2 * int(dd["val_size"])
-        else:
-            total = int(dd["train_size"])
-        return max(1, -(-total // per_job))     # ceiling division
+        # Every iteration samples train + validation + test. phase 1 redraws all three from
+        # the (shrinking) surviving library each round.
+        total = int(dd["train_size"]) + 2 * int(dd["val_size"])
+        # Each set is sharded independently, so three per-set ceilings can add
+        # up to two shards more than one global ceiling. Under-sizing the array
+        # may leave shards undocked, so pad by two.
+        return max(1, -(-total // per_job) + 2)     # ceiling division + margin
 
     # The two helper programs below are plain strings not f-strings. They are
     # Python source embedded in a heredoc, and f-string interpolation would eat
@@ -838,7 +838,8 @@ PYSPLIT
         """
         job_name = f"{self.name}_i{iteration:02d}_p3c_merge"
         header   = self._make_header("phase3c_merge", job_name, "cpu_partition")
-        n_expect = 3 if iteration == 1 else 1
+        # train + validation + test, every iteration (see _shard_count).
+        n_expect = 3
 
         body = textwrap.dedent(f"""\
 
@@ -1001,8 +1002,7 @@ c=d['center']; s=d['size']; print(c[0], c[1], c[2], s[0], s[1], s[2])")
         recall     = self.cfg["dd"]["recall"]
         # Python bool -> "True"/"False", which the DD script expects.
         is_last    = str(iteration == total_iter)
-        # Iter 1 docks train+val+test (3 SDFs); later iters only the aug batch.
-        n_docking_files = 3 if iteration == 1 else 1
+        n_docking_files = 3
 
         body = textwrap.dedent(f"""\
 
