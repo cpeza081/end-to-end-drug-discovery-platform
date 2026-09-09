@@ -278,6 +278,242 @@ and Phase 5 are the long ones.
 
 ---
 
+## Ending a campaign early
+
+If you want to stop the campaign before `total_iterations`, it is not as
+simple as lowering `total_iterations` and resuming, because each iteration's hit
+threshold was fixed at the moment its Phase 4a job script was generated.
+
+Phase 4a passes two values to the DD protocol that both depend on the configured
+total:
+
+```
+--total_iterations <N>    # sets the percent_first to percent_last ramp
+--is_last <True|False>    # True only when iteration == total_iterations
+```
+
+Only the iteration flagged `is_last` applies `percent_last`. Every other
+iteration uses an interpolated, looser cutoff. So if you configured 4 iterations
+and stop after 2, iteration 2's survivors were cut at step 2 of a 4-step ramp.
+That is a legitimate result, but a wider one than a campaign configured for 2
+iterations would have produced.
+
+Editing `total_iterations` now does not retroactively change what already ran.
+You have two options. The first has no further compute. The set already exists on disk. Check its size first, since
+that is the number that actually matters:
+
+```bash
+ITER=<project_dir>/<campaign_name>/iteration_<N>
+wc -l "$ITER/morgan_1024_predictions"/* | tail -1
+```
+
+Then skip to *Cancel what is still queued* below, and extract.
+
+The second option costs one training array. Set `total_iterations` to the iteration you want to end on, then
+re-run that iteration from Phase 4:
+
+```yaml
+dd:
+  total_iterations: 2
+```
+
+```bash
+python dd_active_learning/dd_orchestrator.py --config campaign.yaml \
+    --start-iter 2 --start-phase 4
+```
+
+Phase 4a regenerates with `is_last=True`, applies `percent_last`, and the chain
+ends with the final extraction. The orchestrator rewrites job scripts on every
+run, so nothing in `job_scripts/` needs hand-editing.
+
+### Cancel what is still queued
+
+Look before cancelling. A failed phase usually kills its own chain through
+`DependencyNeverSatisfied`, so there may be nothing left.
+
+```bash
+squeue -u $USER --format="%.18i %.9T %.14r %j"
+```
+
+Then `scancel` the job IDs belonging to iterations you are abandoning.
+
+### Extract the SMILES by hand
+
+The orchestrator only submits `final_extraction` after the configured last
+iteration, so if you choose the first of the two options then you must run it yourself. 
+It takes the prediction directory as an argument and is not special to any particular iteration.
+
+```bash
+mkdir -p <project_dir>/final_iter<N> && cd <project_dir>/final_iter<N>
+
+python "$DD_PROTOCOL_DIR/utilities/final_extraction.py" \
+    -smile_dir "<library.smiles_dir from campaign.yaml>" \
+    -prediction_dir "$FINAL_ITER/morgan_1024_predictions" \
+    -processors 8
+```
+
+It writes `smiles.csv` and `id_score.csv` into the current working
+directory, so `cd` somewhere deliberate first. Both paths must be absolute.
+It parses every SMILES chunk in the prepared library, so you may want to grab
+an allocation.
+
+```bash
+salloc --account=<your-account> --cpus-per-task=8 --mem=32G --time=2:00:00
+```
+
+Re-load your modules and activate the environment inside the allocation. If you
+are unsure what those are, copy them from the top of any generated script in
+`job_scripts/`.
+
+The `score` column in `id_score.csv` is the **model's predicted probability of
+being a virtual hit** (0-1), not a docking affinity. Only the molecules actually
+docked during the campaign have `minimizedAffinity` values, and those live in
+`iteration_<N>/docked/`.
+
+### final_extraction.py requires pandas < 2
+
+`final_extraction.py` uses the positional-axis form `df.drop('score', 1)`, which
+was removed in pandas 2.0. On Alliance clusters `scipy-stack` now provides
+pandas 3.x, so the script fails with:
+
+```
+TypeError: DataFrame.drop() takes from 1 to 2 positional arguments but 3 were given
+```
+
+Pin pandas to solve this issue:
+
+```bash
+pip install --no-index "pandas<2"
+python -c "import pandas; print(pandas.__version__, pandas.__file__)"
+```
+
+Confirm that second line reports a 1.x version. If the virtual environment is
+not writeable, pip falls back to `~/.local`, which then shadows `scipy-stack`
+for every python3.11 environment you use. Undo it with `pip uninstall pandas numpy`.
+
+---
+
+## Known rough edges
+
+Things the orchestrator does not handle for you, and solutions you may need to use.
+
+### A running job's time limit can only be lowered
+
+Only a privileged user can increase a running or suspended job's `TimeLimit`. This being the case, the size of your library and your chunks can impact the time limit needs. If you notice issues with time running out, pending jobs can be raised freely using this command.
+
+```bash
+scontrol update JobId=<id> TimeLimit=<new-limit>
+```
+
+Use the absolute form, not `TimeLimit+=`. The increment form is rejected once an
+array has split into more than one job record.
+
+### `exclude_nodes` applies to every job in a submission
+
+For a job already queued, the field is updatable. It is `ExcNodeList`, shown below.
+
+```bash
+scontrol update JobId=<id> ExcNodeList=<excluded-nodes>
+scontrol show job <id> | grep -o "ExcNodeList=[^ ]*"
+```
+
+### One faulty GPU can consume the array and job path
+
+The Phase 3b preamble runs `nvidia-smi` before docking and exits 1 if the GPU is
+unusable. The freed slot is immediately taken by the next array task, which
+lands on the same bad node and dies the same way. Twelve tasks can burn in six
+minutes.
+
+The symptom is a run of tasks with elapsed times of 2-3 seconds, exit code 1,
+all on one node. Add that node to `exclude_nodes` and resume. Completed shards
+are skipped by the `[ -s "$OUT_FILE" ]` guard.
+
+### Phase 3 walltime has to be measured, not guessed
+
+Measured on Fir with 12 CPUs, one H100, and gnina at
+`--cnn_scoring rescore --exhaustiveness 8 --num_modes 1`, we tested 9.7 to 19.1 hours
+per shard, median around 14. The spread is node-to-node and other users'
+contention, not chemistry, as shards are unsorted slices of the same sample.
+
+`--num_modes 1` controls how many poses are written. It does not speed up docking.
+
+To check a running array against its limit, count `$$$$` records in the
+in-progress output:
+
+```bash
+grep -c '^\$\$\$\$' "$DD_ITERATION/docked_shards"/*.partial.sdf
+```
+
+Divide by that task's own elapsed time. Do not compare raw counts between tasks:
+array tasks do not start together, and can begin days apart as GPUs free up.
+Treat a short extrapolation as approximate, as observed error against a 3-hour
+sample was up to 50%.
+
+If you are on DRA, be aware that priority partitions are banded by walltime (3 h / 12 h / 24 h / 3 d / 7 d) and
+`gpubackfill` caps at 24 hours. Staying at or under 24 hours keeps you eligible
+for both the standard band and backfill. Check yours with `sinfo -o "%20P %10l"`.
+
+### `score_keyword` must be a lower-is-better field
+
+gnina writes several scores per pose. With `--cnn_scoring rescore` you get
+`minimizedAffinity`, `CNNscore`, `CNNaffinity`, `CNNaffinity_variance` and
+`CNN_VS`. Only `minimizedAffinity` is Vina-style kcal/mol where lower is better.
+`CNNscore` and `CNNaffinity` are higher-is-better, and selecting one inverts
+your labels **silently** - the campaign runs to completion and trains on
+backwards data.
+
+The wizard defaults to `minimizedAffinity`, so you will not hit this by leaving things alone. 
+The realistic routes in are as follows.
+
+- You choose `CNNaffinity` on purpose. gnina's own benchmarks rate its CNN
+  scores above the Vina-style one, so you may choose this. 
+  But `CNNaffinity` is a predicted pKd and DD
+  ranks ascending. The better score, used correctly by gnina, becomes the wrong
+  score the moment DD sorts on it.
+- Switching docking engine and carrying the keyword over.
+- Inheriting a `campaign.yaml` from a colleague or an earlier project with
+  a different engine or different gnina flags.
+- Changing `--cnn_scoring` to `none`. The CNN tags disappear from the
+  output entirely. A keyword pointing at one of them then matches nothing, and
+  label extraction produces an empty or near-empty set.
+
+Phase 4 still happily on inverted labels and reports a respectable AUC, because the model reproduces
+whatever labelling it was handed. The failure only shows up when someone
+re-docks the "hits" and finds they score badly.
+
+The way to check this is by seeing if the score is negative. A Vina-style affinity in
+kcal/mol is negative for anything that binds. A pKd or a 0-1 pose score is not.
+
+```bash
+kw=$(grep score_keyword campaign.yaml | awk -F'"' '{print $2}')
+f=$(ls "$ITER/docked_shards"/*_docked.sdf | head -1)
+awk -v k="$kw" '$0 ~ "^> *<"k">" {getline; print $1}' "$f" | head -5
+```
+
+If those numbers come back positive, or nothing prints at all, stop the campaign
+before Phase 4a runs. Also confirm the keyword exists as a tag in the output.
+
+```bash
+grep -o '^> *<[^>]*>' "$f" | sort -u
+```
+
+Check the distribution after the first docked shard. A median around
+-6 to -8 kcal/mol is normal for drug-like molecules in a real pocket.
+
+```bash
+f=$(ls "$ITER/docked_shards"/*_docked.sdf | head -1)
+awk '/^> *<minimizedAffinity>/{getline; print $1}' "$f" | sort -n | \
+    awk '{a[NR]=$1} END{print "n="NR, "min="a[1], "median="a[int(NR/2)], "max="a[NR]}'
+```
+
+### Validation and test sets are resampled every iteration
+
+Phase 1 redraws all three sets from the surviving library each round. 
+Every iteration therefore produces three docked SDFs. If you are reasoning about sample
+counts or array sizing, budget `train_size + 2 * val_size` per iteration.
+
+---
+
 ## Results
 
 After the final iteration:
