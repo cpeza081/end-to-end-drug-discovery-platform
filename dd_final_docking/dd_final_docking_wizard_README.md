@@ -25,8 +25,11 @@ python dd_final_docking_wizard.py --config campaign.yaml
    finished.
 
 2. **Ensures `final_extraction` has been run.** Looks for
-   `<project_dir>/smiles.csv` and `id_score.csv`. If missing, offers to
-   submit the same `final_extraction` job `dd_orchestrator.py` would (via
+   `<project_dir>/smiles.csv` and `id_score.csv` (or `--final-extraction-dir`,
+   if given. DD's `final_extraction.py` writes into whatever
+   directory it's launched from, so there's no fixed location if you ran it
+   by hand somewhere else). If missing, offers to submit the same
+   `final_extraction` job `dd_orchestrator.py` would (via
    `JobScriptFactory.final_extraction`), then exits so you re-run the wizard
    once it finishes.
 
@@ -67,6 +70,7 @@ of the campaign uses.
 |---|---|---|
 | `--config` | required | campaign YAML |
 | `--iteration` | auto-detect | treat this iteration as final instead of auto-detecting it (use if you stopped the campaign early and ran `final_extraction` by hand) |
+| `--final-extraction-dir` | `project_dir` | directory holding `smiles.csv`/`id_score.csv`, if `final_extraction` was run by hand somewhere else |
 | `--top-n` | interactive prompt | dock exactly this many top-scoring molecules |
 | `--batch-size` | 10000 | molecules per array task |
 | `--walltime` | this campaign's `scheduler.walltime.phase3_docking` (24:00:00 by default) | per-array-task walltime |

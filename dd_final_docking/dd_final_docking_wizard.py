@@ -112,12 +112,20 @@ class FinalDockingWizard:
     into dd_final_docking.py, this package's execution engine.
     """
 
-    def __init__(self, cfg: dict, config_path: str, dry_run: bool = False):
+    def __init__(self, cfg: dict, config_path: str, dry_run: bool = False,
+                 final_extraction_dir: str | None = None):
         self.cfg = cfg
         self.config_path = config_path
         # dd_final_docking.py lives alongside this wizard.
         self.engine = Path(__file__).resolve().parent / "dd_final_docking.py"
         self.proj = Path(cfg["project_dir"])
+        # final_extraction.py (DD_protocol) writes smiles.csv/id_score.csv
+        # into whatever directory it's launched from, so default to project_dir (where
+        # this wizard's own auto-submitted final_extraction job cd's to)
+        # but let --final-extraction-dir override it for a manually-run
+        # final_extraction that used a different directory.
+        self.final_extraction_dir = (Path(final_extraction_dir)
+                                      if final_extraction_dir else self.proj)
         self.total_iter = cfg["dd"]["total_iterations"]
         self.scheduler = Scheduler(cfg["scheduler"]["type"],
                                     cfg["scheduler"]["account"], dry_run)
@@ -182,8 +190,8 @@ class FinalDockingWizard:
     # Step 2: make sure final_extraction has been run, and get the count
     # ------------------------------------------------------------------
     def _ensure_final_extraction(self, assume_yes: bool):
-        smiles_path = self.proj / "smiles.csv"
-        id_score_path = self.proj / "id_score.csv"
+        smiles_path = self.final_extraction_dir / "smiles.csv"
+        id_score_path = self.final_extraction_dir / "id_score.csv"
 
         if smiles_path.exists() and id_score_path.exists():
             n = count_lines_fast(id_score_path) - 1  # minus header
@@ -191,8 +199,9 @@ class FinalDockingWizard:
                   f"candidate molecule(s) in {id_score_path}.")
             return n
 
-        print(f"\nNo smiles.csv/id_score.csv in {self.proj} yet -- "
-              "final_extraction hasn't been run.")
+        print(f"\nNo smiles.csv/id_score.csv in {self.final_extraction_dir} "
+              "yet, therefore final_extraction hasn't been run. If you already ran "
+              "it somewhere else, pass --final-extraction-dir.")
 
         existing_job = self.state.data.get("final_extraction_job_id")
         if existing_job:
@@ -217,12 +226,13 @@ class FinalDockingWizard:
         # final_extraction.py writes smiles.csv/id_score.csv into its
         # current working directory, which is the sbatch CALLER's cwd
         # unless the job itself cd's, not necessarily project_dir.
-        # dd_status.py (and this wizard) both expect them in project_dir,
-        # so make that explicit here.
+        # dd_status.py (and this wizard) both expect them in
+        # final_extraction_dir, so make that explicit here.
         anchor = 'echo "[$(date)] Starting iteration ${DD_ITERATION}"'
         script = script.replace(
             anchor,
-            anchor + f'\ncd "{self.proj}"  # final_extraction writes here\n')
+            anchor + f'\ncd "{self.final_extraction_dir}"  '
+                     '# final_extraction writes here\n')
 
         job_id = self._submit("final_extraction", script, depends_on)
         self.state.data["final_extraction_job_id"] = job_id
@@ -266,8 +276,8 @@ class FinalDockingWizard:
                               # behind
 
         cmd = [sys.executable, str(self.engine), "select",
-               "--smiles", str(self.proj / "smiles.csv"),
-               "--id-score", str(self.proj / "id_score.csv"),
+               "--smiles", str(self.final_extraction_dir / "smiles.csv"),
+               "--id-score", str(self.final_extraction_dir / "id_score.csv"),
                "--top-n", str(top_n),
                "--final-dir", str(self.final_dir),
                "--batch-size", str(batch_size)]
@@ -469,6 +479,10 @@ def main():
     parser.add_argument("--iteration", type=int, default=None,
                          help="Treat this iteration as the final one "
                               "instead of auto-detecting it")
+    parser.add_argument("--final-extraction-dir", default=None,
+                         help="Directory holding final_extraction's "
+                              "smiles.csv/id_score.csv, if not project_dir "
+                              "(e.g. it was run by hand from elsewhere)")
     parser.add_argument("--top-n", type=int, default=None,
                          help="Skip the interactive prompt and dock "
                               "this many top-scoring molecules")
@@ -501,7 +515,8 @@ def main():
                       f"(campaign is configured for "
                       f"{cfg['scheduler']['type']}).")
 
-    wizard = FinalDockingWizard(cfg, args.config, dry_run=args.dry_run)
+    wizard = FinalDockingWizard(cfg, args.config, dry_run=args.dry_run,
+                                final_extraction_dir=args.final_extraction_dir)
     wizard.run(args.top_n, args.batch_size, args.walltime,
                args.max_concurrent, args.assume_yes, args.do_merge,
                iteration=args.iteration)
