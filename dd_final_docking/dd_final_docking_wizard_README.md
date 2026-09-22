@@ -66,6 +66,7 @@ of the campaign uses.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--config` | required | campaign YAML |
+| `--iteration` | auto-detect | treat this iteration as final instead of auto-detecting it (use if you stopped the campaign early and ran `final_extraction` by hand) |
 | `--top-n` | interactive prompt | dock exactly this many top-scoring molecules |
 | `--batch-size` | 10000 | molecules per array task |
 | `--walltime` | this campaign's `scheduler.walltime.phase3_docking` (24:00:00 by default) | per-array-task walltime |

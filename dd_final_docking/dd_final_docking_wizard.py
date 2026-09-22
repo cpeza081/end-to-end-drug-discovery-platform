@@ -131,10 +131,16 @@ class FinalDockingWizard:
     # ------------------------------------------------------------------
     # Step 1: connect to the campaign and sanity-check it looks finished
     # ------------------------------------------------------------------
-    def _connect(self, assume_yes: bool):
+    def _connect(self, assume_yes: bool, iteration_override: int | None = None):
         print(f"\nCampaign: {self.cfg['campaign_name']}")
         print(f"Project dir: {self.proj}")
         print(f"Configured total_iterations: {self.total_iter}")
+
+        if iteration_override is not None:
+            self.last_iteration = iteration_override
+            print(f"Using --iteration {iteration_override} (explicit), "
+                  "skipping auto-detection.")
+            return
 
         # Phase 5 (inference) is itself split into 5a_generate (per-chunk
         # script generation) and 5b_array (the actual inference array job).
@@ -149,7 +155,9 @@ class FinalDockingWizard:
         if last_with_phase5 is None:
             print(f"No iteration has a recorded phase-5b (inference array) "
                   f"job in {self.state.path}. This doesn't look like a run "
-                  "launched with dd_orchestrator.py.")
+                  "launched with dd_orchestrator.py. If you stopped the "
+                  "campaign early and already ran final_extraction by "
+                  "hand, pass --iteration N to skip this check.")
             if not _confirm("Continue anyway?", default=False):
                 sys.exit(1)
             return
@@ -375,8 +383,8 @@ class FinalDockingWizard:
     # Entry point
     # ------------------------------------------------------------------
     def run(self, top_n, batch_size: int, walltime, max_concurrent,
-            assume_yes: bool, do_merge: bool):
-        self._connect(assume_yes)
+            assume_yes: bool, do_merge: bool, iteration: int | None = None):
+        self._connect(assume_yes, iteration_override=iteration)
         n_available = self._ensure_final_extraction(assume_yes)
         if n_available is None:
             return
@@ -458,6 +466,9 @@ def main():
     )
     parser.add_argument("--config", "-c", required=True,
                          help="Path to the campaign YAML config file")
+    parser.add_argument("--iteration", type=int, default=None,
+                         help="Treat this iteration as the final one "
+                              "instead of auto-detecting it")
     parser.add_argument("--top-n", type=int, default=None,
                          help="Skip the interactive prompt and dock "
                               "this many top-scoring molecules")
@@ -492,7 +503,8 @@ def main():
 
     wizard = FinalDockingWizard(cfg, args.config, dry_run=args.dry_run)
     wizard.run(args.top_n, args.batch_size, args.walltime,
-               args.max_concurrent, args.assume_yes, args.do_merge)
+               args.max_concurrent, args.assume_yes, args.do_merge,
+               iteration=args.iteration)
 
 
 if __name__ == "__main__":
